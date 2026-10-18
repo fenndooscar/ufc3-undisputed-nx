@@ -74,6 +74,7 @@ cmake --build out/host --target rexglue -j 12
 
 # 4. Translate the game to C++ (from app/, or through tools/codegen.sh).
 cd app && ../sdk/out/win-amd64/rexglue.exe codegen ufc3_undisputed_nx_manifest.toml
+cd ..
 
 # 5. Build and run on PC.
 cmake -S app -B app/out/build/win-amd64-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -82,8 +83,38 @@ cmake -S app -B app/out/build/win-amd64-release -G Ninja -DCMAKE_BUILD_TYPE=Rele
 cmake --build app/out/build/win-amd64-release --target ufc3-undisputed-nx -j 12
 ```
 
-Put `ufc3-undisputed-nx.exe`, `rexruntime.dll` and `rexgpu-xenos.dll` in a folder with `game_root/` beside them (or the
-`.iso`, which it finds by itself) and run the `.exe`. Its log is written to `logs/` in that folder.
+### Launch on Windows after building
+
+From the repository root, run these commands in **PowerShell** to prepare `out/windows/game/` and start the game:
+
+```powershell
+$project = (Get-Location).Path
+$game = Join-Path $project 'out\windows\game'
+New-Item -ItemType Directory -Path $game -Force | Out-Null
+Copy-Item -LiteralPath @(
+    'app\out\build\win-amd64-release\ufc3-undisputed-nx.exe'
+    'sdk\out\win-amd64\rexruntime.dll'
+    'sdk\out\win-amd64\rexgpu-xenos.dll'
+    'app\ufc3-undisputed-nx.toml'
+) -Destination $game
+
+$gameRoot = Join-Path $game 'game_root'
+if (-not (Test-Path -LiteralPath $gameRoot)) {
+    New-Item -ItemType Junction -Path $gameRoot -Target (Join-Path $project 'assets\game_root') | Out-Null
+}
+
+Set-Location $game
+.\ufc3-undisputed-nx.exe --mnk_mode=true --fullscreen=false --window_width=1280 --window_height=720
+```
+
+The junction points to the disc files extracted in step 2 without copying them again. Alternatively, put your
+extracted `game_root/` folder or your game's `.iso` beside the executable. Keep both DLLs and
+`ufc3-undisputed-nx.toml` beside the `.exe`; the configuration contains the settings used for the verified PC build.
+
+Once the folder is prepared, you can also open `out/windows/game/` in Explorer and double-click
+`ufc3-undisputed-nx.exe`. The PowerShell command above enables keyboard/mouse input and starts a 1280x720 window.
+Preserve `B13EBABEBABEBABE/` and `saves/` when updating the executable: these contain your fighters and progress.
+Logs are written to `logs/` in the game folder.
 
 The PC D3D12 backend at 1x resolution supplies GPU-written data when the guest CPU reads it; eager resolve and
 memexport readback are disabled in the configuration. Adjacent resources stay separate by GPU-write generation.
