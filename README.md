@@ -1,6 +1,6 @@
 <div align=center>
 
-<img src="extras/banner.png" alt="UFC 3 Undisputed" width="60%">
+<img src="extras/image.png" alt="UFC 3 Undisputed" width="60%">
 
 </div>
 <h1 align=center>UFC 3 Undisputed — Nintendo Switch port</h1>
