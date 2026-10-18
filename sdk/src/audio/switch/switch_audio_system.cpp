@@ -36,7 +36,7 @@ REXCVAR_DEFINE_BOOL(audio_switch_bomba, true, "Audio",
 REXCVAR_DEFINE_INT32(audio_switch_tramas_en_cola, 10, "Audio",
                      "Con audio_switch_bomba: tramas del juego que se mantienen en cola antes de audout "
                      "(colchon; 10 = 53 ms, 6 hasta la build 105). Mas cola deja esperar al juego sin cortar la "
-                     "salida, a cambio de latencia: nfsmw_audio_esperar_servidor_ms espera hasta 30 ms; se lee "
+                     "salida, a cambio de latencia: ufc3_undisputed_nx_audio_esperar_servidor_ms espera hasta 30 ms; se lee "
                      "al abrir el audio");
 
 namespace rex::audio::nx {

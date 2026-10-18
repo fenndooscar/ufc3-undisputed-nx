@@ -166,7 +166,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             MarkVblank();
             last_frame_time += interval_ticks;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          DispatchPendingInterrupts();
+          rex::thread::Wait(interrupt_event_.get(), false, std::chrono::milliseconds(1));
         }
         return 0;
       }));
@@ -186,6 +187,7 @@ void GraphicsSystem::Shutdown() {
 
   if (vsync_worker_thread_) {
     vsync_worker_running_ = false;
+    interrupt_event_->Set();
     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
     vsync_worker_thread_.reset();
   }
@@ -289,13 +291,27 @@ void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_siz
 }
 
 void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data) {
+  auto lock = thread::global_critical_region::AcquireDirect();
   interrupt_callback_ = callback;
   interrupt_callback_data_ = user_data;
   REXGPU_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
 }
 
+void GraphicsSystem::QueueInterruptCallback(uint32_t cpu) {
+  if (cpu < 6) {
+    pending_interrupt_cpus_.fetch_or(uint32_t(1) << cpu, std::memory_order_release);
+    interrupt_event_->Set();
+  }
+}
+
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
-  if (!interrupt_callback_) {
+  uint32_t callback, user_data;
+  {
+    auto lock = thread::global_critical_region::AcquireDirect();
+    callback = interrupt_callback_;
+    user_data = interrupt_callback_data_;
+  }
+  if (!callback) {
     return;
   }
 
@@ -311,8 +327,8 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   // REXGPU_INFO("Dispatching GPU interrupt at {:08X} w/ mode {} on cpu {}",
   //          interrupt_callback_, source, cpu);
 
-  uint64_t args[] = {source, interrupt_callback_data_};
-  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
+  uint64_t args[] = {source, user_data};
+  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), callback, args,
                                          rex::countof(args));
 }
 
@@ -329,6 +345,15 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+}
+
+void GraphicsSystem::DispatchPendingInterrupts() {
+  const uint32_t pending = pending_interrupt_cpus_.exchange(0, std::memory_order_acquire);
+  for (uint32_t cpu = 0; cpu < 6; ++cpu) {
+    if (pending & (uint32_t(1) << cpu)) {
+      DispatchInterruptCallback(1, cpu);
+    }
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

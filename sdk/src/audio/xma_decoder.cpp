@@ -181,7 +181,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 /*
  * Measuring the XMA cost on the calling thread.
  *
- * The kick (XMAEnableContext) decodes right here, on the thread that requests it (in NFSMW, the game's
+ * The kick (XMAEnableContext) decodes right here, on the thread that requests it (in UFC3_UNDISPUTED_NX, the game's
  * audio server thread), and the lock (XMADisableContext) waits for the context lock if the worker
  * holds it. On the PC, sub_825E1CD0, which does both once per voice, takes 15 % of that thread's CPU,
  * with peaks of 22 ms in 500 ms windows.

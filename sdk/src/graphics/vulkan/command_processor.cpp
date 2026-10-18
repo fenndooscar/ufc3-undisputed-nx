@@ -608,43 +608,12 @@ VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
-  InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
 }
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
     shared_memory_->InvalidateAllPages();
-  }
-}
-
-void VulkanCommandProcessor::InvalidateAllVertexBufferResidency() {
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
-  for (VertexBufferState& state : vertex_buffer_states_) {
-    state.address = UINT32_MAX;
-    state.size = UINT32_MAX;
-  }
-}
-
-void VulkanCommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_index) {
-  if (vfetch_index >= vertex_buffer_states_.size()) {
-    return;
-  }
-  vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
-}
-
-void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
-                                                                  uint32_t last_vfetch) {
-  if (first_vfetch > last_vfetch) {
-    std::swap(first_vfetch, last_vfetch);
-  }
-  if (first_vfetch >= vertex_buffer_states_.size()) {
-    return;
-  }
-  last_vfetch = std::min(last_vfetch, uint32_t(vertex_buffer_states_.size() - 1));
-  for (uint32_t vfetch_index = first_vfetch; vfetch_index <= last_vfetch; ++vfetch_index) {
-    InvalidateVertexBufferResidency(vfetch_index);
   }
 }
 
@@ -782,7 +751,6 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
   }
-  InvalidateAllVertexBufferResidency();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1909,7 +1877,6 @@ void VulkanCommandProcessor::ShutdownContext() {
 #if REX_PLATFORM_SWITCH
   if (RexNativeVideoShutdown) RexNativeVideoShutdown();
 #endif
-  InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -2167,7 +2134,6 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
     }
-    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 
@@ -2250,7 +2216,6 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
   }
 
@@ -2294,8 +2259,6 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   RexSwitchPerfCount(0);
   const bool tiene_video_nativo = RexNativeVideoBeginSwap && RexNativeVideoBeginSwap();
 #endif
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
 
   if (!graphics_system_)
     return;
@@ -4028,10 +3991,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
-      uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
-        continue;
-      }
+      // SharedMemory owns page validity. An unchanged fetch can still reference
+      // CPU-written or frame-invalidated data, so always revalidate the range.
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
@@ -4052,11 +4013,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
-      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-        continue;
-      }
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
@@ -4064,16 +4020,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
       }
-      state.address = vfetch_constant.address;
-      state.size = vfetch_constant.size;
-      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
 
   // Synchronize the memory pages backing memory scatter export streams, and
   // calculate the range that includes the streams for the buffer barrier.
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
-  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+  for (draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    // The stream constant's element count can be larger than what the game
+    // allocated - clamping it keeps everything derived from the range inside
+    // that allocation.
+    draw_util::ClampMemExportRangeToAllocation(memexport_range, memory_);
     uint32_t memexport_range_base_bytes = memexport_range.base_address_dwords << 2;
     if (!shared_memory_->RequestRange(memexport_range_base_bytes, memexport_range.size_bytes)) {
       REXGPU_ERROR(

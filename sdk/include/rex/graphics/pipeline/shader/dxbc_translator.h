@@ -236,6 +236,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // taking into account the potential relation with occlusion queries (but
     // should be safe at least temporarily).
     kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    kSysFlag_DiagnosticTint_Shift,
 
     kSysFlag_Count,
 
@@ -260,6 +261,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ROVDepthWrite = 1u << kSysFlag_ROVDepthWrite_Shift,
     kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
     kSysFlag_ROVDepthStencilEarlyWrite = 1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    kSysFlag_DiagnosticTint = 1u << kSysFlag_DiagnosticTint_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 
@@ -595,6 +597,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   void ProcessVertexFetchInstruction(const ParsedVertexFetchInstruction& instr) override;
   void ProcessTextureFetchInstruction(const ParsedTextureFetchInstruction& instr) override;
+  void RestoreTexture16UnsignedInteger(uint32_t fetch_index, uint32_t components,
+                                       uint32_t signs_temp, bool point_sampled);
   void ProcessAluInstruction(const ParsedAluInstruction& instr,
                              uint8_t memexport_eM_potentially_written_before) override;
 

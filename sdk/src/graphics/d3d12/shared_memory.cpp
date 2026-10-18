@@ -25,6 +25,8 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DECLARE(bool, trace_shared_memory_readback);
+
 namespace rex::graphics::d3d12 {
 
 D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
@@ -35,8 +37,8 @@ D3D12SharedMemory::~D3D12SharedMemory() {
   Shutdown(true);
 }
 
-bool D3D12SharedMemory::Initialize() {
-  InitializeCommon();
+bool D3D12SharedMemory::Initialize(bool cpu_readback) {
+  InitializeCommon(cpu_readback);
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
@@ -142,6 +144,9 @@ bool D3D12SharedMemory::Initialize() {
 }
 
 void D3D12SharedMemory::Shutdown(bool from_destructor) {
+  // Unregister and drain CPU providers before destroying their GPU resources.
+  ShutdownCommon();
+  cpu_readback_cached_data_.clear();
   upload_buffer_pool_.reset();
 
   ui::d3d12::util::ReleaseAndNull(buffer_descriptor_heap_);
@@ -154,11 +159,6 @@ void D3D12SharedMemory::Shutdown(bool from_destructor) {
   }
   buffer_tiled_heaps_.clear();
 
-  // If calling from the destructor, the SharedMemory destructor will call
-  // ShutdownCommon.
-  if (!from_destructor) {
-    ShutdownCommon();
-  }
 }
 
 void D3D12SharedMemory::ClearCache() {
@@ -299,6 +299,68 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
                                    D3D12_TILE_MAPPING_FLAG_NONE);
   command_processor_.NotifyQueueOperationsDoneDirectly();
   return true;
+}
+
+bool D3D12SharedMemory::WriteGpuMemory(uint32_t address, uint32_t value) {
+  if ((address & 3) || address > kBufferSize - sizeof(value) ||
+      !RequestRange(address, sizeof(value))) {
+    return false;
+  }
+  ID3D12Resource* upload_buffer;
+  size_t upload_offset;
+  uint8_t* mapping = upload_buffer_pool_->Request(
+      command_processor_.GetCurrentSubmission(), sizeof(value), alignof(uint32_t),
+      &upload_buffer, &upload_offset, nullptr);
+  if (!mapping) {
+    REXGPU_ERROR("Shared memory: Failed to allocate a packet write");
+    return false;
+  }
+  std::memcpy(mapping, &value, sizeof(value));
+  CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+      buffer_, address, upload_buffer, upload_offset, sizeof(value));
+  RangeWrittenByGpu(address, sizeof(value));
+  return true;
+}
+
+bool D3D12SharedMemory::ReadbackForCpu(
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges, std::vector<uint8_t>& data) {
+  return command_processor_.CallInThreadAndWait([&]() {
+    // Several guest threads may fault before the first one publishes its
+    // snapshot. Reuse that completed snapshot while memory is unchanged,
+    // rather than submitting and waiting for the same 4 KB copy repeatedly.
+    // Bound storage to one host page; atlas transfers are never retained.
+    const uint32_t page_bytes = uint32_t(1) << page_size_log2();
+    const bool single_page = ranges.size() == 1 && ranges.front().first < kBufferSize &&
+                             !(ranges.front().first & (page_bytes - 1)) &&
+                             ranges.front().second == page_bytes;
+    const uint64_t generation = single_page ? GetMemoryGeneration(ranges.front().first) : 0;
+    if (single_page && generation == cpu_readback_cached_generation_ &&
+        ranges.front().first == cpu_readback_cached_start_ &&
+        cpu_readback_cached_data_.size() == ranges.front().second) {
+      data = cpu_readback_cached_data_;
+      if (REXCVAR_GET(trace_shared_memory_readback)) {
+        REXLOG_INFO("[GPU-readback-cache] page={:08X} generation={}",
+                    ranges.front().first, generation);
+      }
+      return true;
+    }
+    if (!command_processor_.ReadbackSharedMemoryForCpu(ranges, data)) {
+      return false;
+    }
+    if (single_page) {
+      cpu_readback_cached_generation_ = generation;
+      cpu_readback_cached_start_ = ranges.front().first;
+      cpu_readback_cached_data_ = data;
+    }
+    return true;
+  });
+}
+
+bool D3D12SharedMemory::PrepareRangesForGpu(
+    const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+  return command_processor_.PreparePacketMemoryReads(ranges, count);
 }
 
 bool D3D12SharedMemory::UploadRanges(

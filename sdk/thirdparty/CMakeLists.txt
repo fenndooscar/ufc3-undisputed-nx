@@ -424,7 +424,7 @@ endif()
 # =============================================================================
 # FFmpeg - Audio/video codec library (for XMA decoding)
 # Only builds libavutil and libavcodec needed for WMA Pro decoding
-# NFSMW: also the WMV3 decoder for the cutscenes (config_nfsmw_wmv3.h)
+# UFC3_UNDISPUTED_NX: also the WMV3 decoder for the cutscenes (config_ufc3_undisputed_nx_wmv3.h)
 # =============================================================================
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
@@ -658,7 +658,7 @@ add_library(libavcodec STATIC
     ${FFMPEG_DIR}/libavcodec/fft_float.c
     ${FFMPEG_DIR}/libavcodec/fft_fixed_32.c
     ${FFMPEG_DIR}/libavcodec/fft_init_table.c
-    # NFSMW: WMV3 (VC-1 main profile) and what it selects
+    # UFC3_UNDISPUTED_NX: WMV3 (VC-1 main profile) and what it selects
     ${FFMPEG_DIR}/libavcodec/vc1dec.c
     ${FFMPEG_DIR}/libavcodec/vc1_block.c
     ${FFMPEG_DIR}/libavcodec/vc1_loopfilter.c
@@ -719,7 +719,7 @@ if(IS_X86_64)
         ${FFMPEG_DIR}/libavcodec/x86/fdct.c
         ${FFMPEG_DIR}/libavcodec/x86/mpegaudiodsp.c
         ${FFMPEG_DIR}/libavcodec/x86/dct_init.c
-        # NFSMW: WMV3 initializations (C only: no assembly on the PC)
+        # UFC3_UNDISPUTED_NX: WMV3 initializations (C only: no assembly on the PC)
         ${FFMPEG_DIR}/libavcodec/x86/blockdsp_init.c
         ${FFMPEG_DIR}/libavcodec/x86/h263dsp_init.c
         ${FFMPEG_DIR}/libavcodec/x86/h264chroma_init.c
@@ -746,7 +746,7 @@ if(IS_ARM64)
         ${FFMPEG_DIR}/libavcodec/aarch64/neon.S
         ${FFMPEG_DIR}/libavcodec/aarch64/mpegaudiodsp_init.c
         ${FFMPEG_DIR}/libavcodec/aarch64/mpegaudiodsp_neon.S
-        # NFSMW: NEON for WMV3
+        # UFC3_UNDISPUTED_NX: NEON for WMV3
         ${FFMPEG_DIR}/libavcodec/aarch64/h264chroma_init_aarch64.c
         ${FFMPEG_DIR}/libavcodec/aarch64/h264cmc_neon.S
         ${FFMPEG_DIR}/libavcodec/aarch64/h264qpel_init_aarch64.c

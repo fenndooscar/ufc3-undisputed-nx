@@ -1,13 +1,13 @@
 # Third-party notices
 
-NFSMW-NX is built on the work of other projects. Their licenses apply to their code and to the parts of this
+UFC3_UNDISPUTED_NX-NX is built on the work of other projects. Their licenses apply to their code and to the parts of this
 repository derived from it.
 
 ## Projects this port is derived from
 
 | Project | Used for | License |
 |---|---|---|
-| [NFSMW Recompiled](https://github.com/madelrandel-blip/NFSMW-Recompiled) by madelrandel-blip | The recompilation project this port started from: `app/` (hooks, configuration, codegen setup) and tools | GPL-3.0 |
+| [UFC3_UNDISPUTED_NX Recompiled](https://github.com/madelrandel-blip/UFC3_UNDISPUTED_NX-Recompiled) by madelrandel-blip | The recompilation project this port started from: `app/` (hooks, configuration, codegen setup) and tools | GPL-3.0 |
 | [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay, with portions from [Xenia](https://xenia.jp) (Ben Vanik and the Xenia contributors) | `sdk/`: code generator, Xbox 360 kernel and runtime, GPU command processing | BSD-3-Clause (`sdk/LICENSE`) |
 | [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev and contributors | `shaders/XenosRecomp`: Xenos microcode to HLSL translator | MIT (`shaders/LICENSE.md`) |
 | [mesa-switch](https://github.com/danfromtico/mesa-switch) by danfromtico, on top of [Mesa](https://mesa3d.org) | The Vulkan driver (NVK) and shader compiler (NAK) for Horizon, linked into the NRO; `mesa/` holds the changes | MIT (Mesa's licenses per file) |
@@ -45,7 +45,7 @@ Libraries used by the SDK, the NRO and the code generator, fetched from the subm
 This port modifies these files of the SDK's third-party tree; the modified copies are in `sdk/thirdparty`:
 
 - `FFmpeg/libavcodec/fft_template.c` and `FFmpeg/libavcodec/mdct_template.c`
-- `FFmpeg/config.h`, plus `FFmpeg/config_switch_aarch64.h` and `FFmpeg/config_nfsmw_wmv3.h` (new): the configuration
+- `FFmpeg/config.h`, plus `FFmpeg/config_switch_aarch64.h` and `FFmpeg/config_ufc3-undisputed-nx_wmv3.h` (new): the configuration
   for AArch64 Horizon and for a build limited to the WMV3 decoder
 - `ffmpeg-overlay/codec_list.c`: registers the WMV3 decoder
 - `CMakeLists.txt`: builds the libraries for the Switch
@@ -56,7 +56,7 @@ in [docs/building.md](docs/building.md).
 
 ## Installer page
 
-The [installer page](https://github.com/StevensND/nfsmw-nx-installer) runs WebAssembly builds of the shader translator
+The [installer page](https://github.com/StevensND/ufc3-undisputed-nx-installer) runs WebAssembly builds of the shader translator
 and packer from `shaders/`, libmspack (LZX), and [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)
 v2025.1 (University of Illinois/NCSA Open Source License, with LLVM's license terms). Its own notices are in that
 repository.

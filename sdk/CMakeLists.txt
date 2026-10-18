@@ -198,6 +198,26 @@ else()
     message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux, and macOS only.")
 endif()
 
+# x86-64 code uses SSSE3/SSE4.1 intrinsics (rex::memory's byte swaps, among others), which clang does not enable
+# by default for a generic x86-64 target: it stops at the always_inline check with "requires target feature
+# 'ssse3'". rexglue_apply_target_settings() adds -msse4.1, but it only runs for host app targets, and the SDK's
+# own libraries (rexcore and friends) are OBJECT libraries that never receive it. Set it globally instead.
+#
+# Two traps here, both found by building the PC app with clang-cl:
+#   1. CMake defines MSVC for clang-cl too (it only drives the same command line). The first version of this
+#      block said "NOT MSVC", so with clang-cl the flag was never added at all and the whole SDK failed to
+#      compile. Real MSVC genuinely needs nothing (it accepts the intrinsics without /arch), clang-cl does.
+#   2. clang-cl's own argument parser reads "-msse4.1" as "-msse4" plus a stray input file ".1" ("unknown
+#      argument ignored in clang-cl '-msse4'") and then compiles without the feature: the same error again.
+#      The GNU spelling has to go behind /clang: for the MSVC frontend.
+if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64" AND NOT MSVC)
+    add_compile_options(-msse4.1)
+elseif(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64" AND
+       CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND
+       CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(/clang:-msse4.1)
+endif()
+
 # Build config as compile definition (multi-config generators don't know config at configure time)
 add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
 

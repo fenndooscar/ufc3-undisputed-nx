@@ -19,6 +19,8 @@
 #include <rex/system/xfile.h>
 #include <rex/thread/mutex.h>
 
+#include <memory>
+#include <new>
 #include <span>
 
 namespace rex::system {
@@ -125,16 +127,9 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
     if (UINT32_MAX - buffer_guest_address < buffer_length) {
       result = X_STATUS_ACCESS_VIOLATION;
     } else {
-      // Games often read directly to texture/vertex buffer memory - in this
-      // case, invalidation notifications must be sent. However, having any
-      // memory callbacks in the range will result in STATUS_ACCESS_VIOLATION at
-      // least on Windows, without anything being read or any callbacks being
-      // triggered. So for physical memory, host protection must be bypassed,
-      // and invalidation callbacks must be triggered manually (it's also wrong
-      // to trigger invalidation callbacks before reading in this case, because
-      // during the read, the guest may still access the data around the buffer
-      // that is located in the same host pages as the buffer's start and end,
-      // on the GPU - and that must not trigger a race condition).
+      // OS file reads do not run our access-violation callbacks. Stage physical
+      // reads, then copy through the protected guest alias so GPU data providers
+      // preserve untouched page bytes before the CPU writes the file contents.
       uint32_t buffer_guest_high_address = buffer_guest_address + buffer_length - 1;
       rex::memory::BaseHeap* buffer_start_heap = memory()->LookupHeap(buffer_guest_address);
       const rex::memory::BaseHeap* buffer_end_heap =
@@ -155,21 +150,47 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
-          result = file_->ReadSync(
-              std::span<uint8_t>(
-                  buffer_physical_heap
-                      ? memory()->TranslatePhysical(
-                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
-                      : memory()->TranslateVirtual(buffer_guest_address),
-                  buffer_length),
-              size_t(byte_offset), &bytes_read);
-          if (XSUCCEEDED(result)) {
-            if (buffer_physical_heap) {
-              buffer_physical_heap->TriggerCallbacks(
-                  rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,
-                  buffer_length, true, true);
+          if (buffer_physical_heap) {
+            const uint32_t staging_length = std::min(buffer_length, 64u * 1024u);
+            std::unique_ptr<uint8_t[]> staging(new (std::nothrow) uint8_t[staging_length]);
+            if (!staging) {
+              result = X_STATUS_NO_MEMORY;
+            } else {
+              while (bytes_read < buffer_length) {
+                const uint32_t chunk_length =
+                    std::min(staging_length, buffer_length - uint32_t(bytes_read));
+                size_t chunk_read = 0;
+                result = file_->ReadSync(std::span<uint8_t>(staging.get(), chunk_length),
+                                         size_t(byte_offset) + bytes_read, &chunk_read);
+                if (chunk_read > chunk_length) {
+                  result = X_STATUS_UNSUCCESSFUL;
+                  break;
+                }
+                if (chunk_read) {
+                  bool provider_failed = false;
+                  buffer_physical_heap->TriggerCallbacks(
+                      rex::thread::global_critical_region::AcquireDirect(),
+                      buffer_guest_address + uint32_t(bytes_read), uint32_t(chunk_read),
+                      true, true, true, false, &provider_failed);
+                  if (provider_failed) {
+                    result = X_STATUS_UNSUCCESSFUL;
+                    break;
+                  }
+                  std::memcpy(memory()->TranslateVirtual(buffer_guest_address + uint32_t(bytes_read)),
+                              staging.get(), chunk_read);
+                  bytes_read += chunk_read;
+                }
+                if (!XSUCCEEDED(result) || chunk_read < chunk_length) {
+                  break;
+                }
+              }
             }
-
+          } else {
+            result = file_->ReadSync(
+                std::span<uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
+                size_t(byte_offset), &bytes_read);
+          }
+          if (XSUCCEEDED(result)) {
             if (byte_offset) {
               position_ = byte_offset;
             }
@@ -263,9 +284,22 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
   }
 
   size_t bytes_written = 0;
-  X_STATUS result = file_->WriteSync(
-      std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
-      size_t(byte_offset), &bytes_written);
+  X_STATUS result = X_STATUS_ACCESS_VIOLATION;
+  if (UINT32_MAX - buffer_guest_address >= buffer_length) {
+    bool provider_failed = false;
+    rex::memory::BaseHeap* source_heap = memory()->LookupHeap(buffer_guest_address);
+    if (buffer_length && source_heap &&
+        source_heap->heap_type() == memory::HeapType::kGuestPhysical) {
+      static_cast<rex::memory::PhysicalHeap*>(source_heap)->TriggerCallbacks(
+          rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,
+          buffer_length, false, true, true, false, &provider_failed);
+    }
+    result = provider_failed
+                 ? X_STATUS_UNSUCCESSFUL
+                 : file_->WriteSync(std::span<const uint8_t>(
+                                        memory()->TranslateVirtual(buffer_guest_address), buffer_length),
+                                    size_t(byte_offset), &bytes_written);
+  }
   if (XSUCCEEDED(result)) {
     position_ += bytes_written;
   }

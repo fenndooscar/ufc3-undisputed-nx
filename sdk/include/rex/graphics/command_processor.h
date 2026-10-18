@@ -94,6 +94,7 @@ class CommandProcessor {
   virtual void Shutdown();
 
   void CallInThread(std::function<void()> fn);
+  bool CallInThreadAndWait(std::function<bool()> fn);
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -166,6 +167,9 @@ class CommandProcessor {
   virtual void OnGammaRampPWLValueWritten() {}
 
   virtual void MakeCoherent();
+  // Packet memory writes are ordered after prior GPU work. Backends with CPU
+  // data providers may leave the value on the GPU until an actual CPU read.
+  virtual bool WriteGpuMemory(uint32_t address, uint32_t value);
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
@@ -238,6 +242,10 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
+  bool QueueInThread(std::function<void()> fn);
+  bool HasPendingFunctions();
+  void ProcessPendingFunctions();
+  std::mutex pending_fns_mutex_;
   std::queue<std::function<void()>> pending_fns_;
 
   // MicroEngine binary from PM4_ME_INIT

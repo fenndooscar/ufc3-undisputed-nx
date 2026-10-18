@@ -976,7 +976,7 @@ void __wrap_armDCacheClean(void* addr, size_t size) {
 }
 
 /*
- * The presentation interval (nfsmw_intervalo_swap).
+ * The presentation interval (ufc3_undisputed_nx_intervalo_swap).
  *
  * It is reapplied on every present, not when the chain is created, on purpose: the WSI sets it to 1
  * when creating the swapchain, and the chain is recreated when switching from docked to handheld.

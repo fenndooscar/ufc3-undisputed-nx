@@ -1,4 +1,4 @@
-# Builds the NRO of the default tree (app/, PAL Spanish) for the Switch: app/out/sw8/nfsmw.nro.
+# Builds the NRO of the default tree (app/, PAL Spanish) for the Switch: app/out/sw8/ufc3-undisputed-nx.nro.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\build.ps1 -MesaSdk C:\mesa-sdk\opt\devkitpro\portlibs\switch
 #
@@ -29,8 +29,8 @@ New-Item -ItemType Directory -Force $out | Out-Null
 if (-not (Test-Path "$out/CMakeCache.txt")) {
     Invoke-CMake 'configure' @('-S', $app, '-B', $out, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
         "-DCMAKE_TOOLCHAIN_FILE=$root/tools/switch/cmake/switch-devkitA64.cmake", "-DREXSDK_DIR=$root/sdk",
-        "-DREXGLUE_SWITCH_NVK_SDK=$MesaSdk", "-DNFSMW_PGO=$Pgo", '-DNFSMW_BUILD_LAUNCHER=OFF')
+        "-DREXGLUE_SWITCH_NVK_SDK=$MesaSdk", "-DUFC3_UNDISPUTED_NX_PGO=$Pgo", '-DUFC3_UNDISPUTED_NX_BUILD_LAUNCHER=OFF')
 }
 $start = Get-Date
 Invoke-CMake 'build' @('--build', $out, '-j', "$Jobs")
-Write-Output "Built $out/nfsmw.nro in $([int]((Get-Date) - $start).TotalMinutes) min"
+Write-Output "Built $out/ufc3-undisputed-nx.nro in $([int]((Get-Date) - $start).TotalMinutes) min"

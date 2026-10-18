@@ -30,7 +30,7 @@ class D3D12SharedMemory : public SharedMemory {
   D3D12SharedMemory(D3D12CommandProcessor& command_processor, memory::Memory& memory);
   ~D3D12SharedMemory() override;
 
-  bool Initialize();
+  bool Initialize(bool cpu_readback = true);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
 
@@ -39,6 +39,9 @@ class D3D12SharedMemory : public SharedMemory {
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();
+
+  // Queue a packet word after prior GPU writes, without publishing it to CPU RAM.
+  bool WriteGpuMemory(uint32_t address, uint32_t value);
 
   // RequestRange may transition the buffer to copy destination - call it before
   // UseForReading or UseForWriting.
@@ -80,9 +83,17 @@ class D3D12SharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  bool PrepareRangesForGpu(const std::pair<uint32_t, uint32_t>* ranges, size_t count) override;
+  bool ReadbackForCpu(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+                      std::vector<uint8_t>& data) override;
 
  private:
   D3D12CommandProcessor& command_processor_;
+
+  // Worker-thread-only snapshot for concurrent faults on the same host page.
+  uint64_t cpu_readback_cached_generation_ = UINT64_MAX;
+  uint32_t cpu_readback_cached_start_ = 0;
+  std::vector<uint8_t> cpu_readback_cached_data_;
 
   // The 512 MB tiled buffer.
   ID3D12Resource* buffer_ = nullptr;

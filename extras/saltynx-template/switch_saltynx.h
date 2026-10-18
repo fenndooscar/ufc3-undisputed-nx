@@ -2,7 +2,7 @@
  * SaltyNX support for a homebrew program (.nro): FPS and resolution in the console overlays (Status Monitor Overlay
  * and its forks, such as Horizon OC Monitor), and the handheld/docked mode chosen in ReverseNX-RT.
  *
- * Template taken from NFSMW-NX (sdk/src/ui/switch_saltynx.cpp). It only needs libnx.
+ * Template taken from UFC3_UNDISPUTED_NX-NX (sdk/src/ui/switch_saltynx.cpp). It only needs libnx.
  * How it works, step by step: docs/console-overlays.md.
  */
 #ifndef SWITCH_SALTYNX_H_

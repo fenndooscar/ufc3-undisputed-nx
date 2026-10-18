@@ -25,7 +25,7 @@ The order that worked:
    code jumps through) and some function chunks (functions that the executable stores in several pieces).
 3. Get the game to start and play with ReXGlue's own graphics, which imitate the Xbox 360 GPU.
 
-For this game, the [NFSMW Recompiled](https://github.com/madelrandel-blip/NFSMW-Recompiled) project had already done
+For this game, the [UFC3_UNDISPUTED_NX Recompiled](https://github.com/madelrandel-blip/UFC3_UNDISPUTED_NX-Recompiled) project had already done
 this stage.
 
 Two things from this repository help here:
@@ -66,7 +66,7 @@ So the port has its own renderer. The game keeps using its own [Direct3D](glossa
 list of GPU commands (the [PM4 ring](glossary.md#pm4-ring)) as always. A thread of the port, the
 [ring thread](glossary.md#ring-thread), reads that list and draws the same thing directly with Vulkan.
 
-What you can reuse from `app/src/nfsmw_nativo_*` ("nativo" means native):
+What you can reuse from `app/src/ufc3-undisputed-nx_nativo_*` ("nativo" means native):
 
 - the reader of the command list, the tracking of the GPU settings, and the recording of each draw;
 - [render targets](glossary.md#render-target) as normal Vulkan images, and [resolves](glossary.md#resolve) that avoid
@@ -77,7 +77,7 @@ What you can reuse from `app/src/nfsmw_nativo_*` ("nativo" means native):
 
 What is specific to this game: the addresses of the [hooks](glossary.md#hook), and knowing its render passes (which
 pass draws the shadow map, the reflections, the cubemap). Start with a tracing phase: wrap the game's Direct3D
-functions and write every call to the log (`app/src/nfsmw_d3d_trace.cpp`). That confirms each address before you
+functions and write every call to the log (`app/src/ufc3-undisputed-nx_d3d_trace.cpp`). That confirms each address before you
 replace anything.
 
 ## 4. Translate the shaders before playing

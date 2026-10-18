@@ -5,7 +5,7 @@
 - The game's [shaders](glossary.md#shader) are small GPU programs written for the Xbox 360 GPU. The Switch GPU cannot
   run them, so they are translated before playing into [SPIR-V](glossary.md#spir-v), the format Vulkan uses.
 - The translator is [XenosRecomp](glossary.md#xenosrecomp). This port's version is in [`shaders/`](../shaders), and
-  every change is inside code marked `NFSMW_RECOMP`, so it can be compared with the original tool.
+  every change is inside code marked `UFC3_UNDISPUTED_NX_RECOMP`, so it can be compared with the original tool.
 - This page explains the path from the disc to the GPU, the fixes needed for the image to look right, the changes
   that made the shaders faster, and how each change was checked.
 
@@ -23,7 +23,7 @@
 3. **Translate** the [microcode](glossary.md#microcode) to [HLSL](glossary.md#hlsl) with XenosRecomp and a shared
    header file, `shader_common.h`.
 4. **Compile** the HLSL to SPIR-V with [DXC](glossary.md#dxc).
-5. **Pack** all the SPIR-V shaders, and the extra information the renderer needs, into one file: `nfsmw_shaders.nfsp`,
+5. **Pack** all the SPIR-V shaders, and the extra information the renderer needs, into one file: `ufc3-undisputed-nx_shaders.nfsp`,
    the [shader library](glossary.md#shader-library). Each shader is found in it by a fingerprint (a hash) of its
    microcode.
 

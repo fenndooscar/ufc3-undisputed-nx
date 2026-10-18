@@ -35,12 +35,12 @@
  * exactly on those 64 KB. The RAM ceiling goes down, not up: 16 windows x 256 KB = 4 MB, against
  * 128 x 64 KB = 8 MB.
  */
-REXCVAR_DEFINE_INT32(nfsmw_io_ventana_kb, 256, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_ventana_kb, 256, "Filesystem",
                      "Lectura anticipada por fichero, en KB (0 = apagada). Solo datos de solo lectura.");
 
 // How many windows can exist at once. A hard cap so that opening many files does not eat the RAM.
 // 128 was an arbitrary number; in a whole measured session there were never more than 10 live windows.
-REXCVAR_DEFINE_INT32(nfsmw_io_ventanas_max, 16, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_ventanas_max, 16, "Filesystem",
                      "Maximo de ficheros con lectura anticipada a la vez.");
 
 /*
@@ -65,18 +65,18 @@ REXCVAR_DEFINE_INT32(nfsmw_io_ventanas_max, 16, "Filesystem",
  * loading screens there is no correlation between slow reads and stutters. It is on because it
  * bounds the worst case and fixes short reads, not because a gain is expected.
  */
-REXCVAR_DEFINE_INT32(nfsmw_io_trozo_mb, 4, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_trozo_mb, 4, "Filesystem",
                      "Parte las lecturas directas grandes en trozos de estos MB (0 = de una sola vez).");
 
 /*
- * RAM read cache by blocks (nfsmw_io_cache_mb, off). The game rereads the same data from the SD
+ * RAM read cache by blocks (ufc3_undisputed_nx_io_cache_mb, off). The game rereads the same data from the SD
  * every lap.
  *
  * Measured over 5 minutes of racing (line `[io] rangos:`):
  *     from minute 2 on, between 79 % and 95 % of the bytes the game reads from disk had already
  *     been read before, and the sizes repeat with the lap period (20.9 MB three times, 13.0-13.6 MB
  *     twice...).
- * NFSMW streaming works per zone pack (eStreamingPack): on leaving a zone it releases the whole
+ * UFC3_UNDISPUTED_NX streaming works per zone pack (eStreamingPack): on leaving a zone it releases the whole
  * pack and on entering again it asks for it again. We evict nothing (`0 desalojos` in every
  * report): the one releasing it is the game's memory manager, and it cannot be told no.
  *
@@ -109,7 +109,7 @@ REXCVAR_DEFINE_INT32(nfsmw_io_trozo_mb, 4, "Filesystem",
  *  game crawled.)
  * ================================================================================================
  */
-REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_cache_mb, 0, "Filesystem",
                      "Cache en RAM de lo ya leido del disco, en MB (0 = apagada). Solo datos de solo "
                      "lectura. El juego relee cada vuelta lo mismo.");
 
@@ -124,7 +124,7 @@ REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
  * blocks for 132 to 140 ms. They are rereads of the zone pack: the game releases the pack on
  * leaving and asks for it again on entering, with the same offset and the same size.
  *
- * Why by range and not by blocks. The block cache above (nfsmw_io_cache_mb) failed on the console
+ * Why by range and not by blocks. The block cache above (ufc3_undisputed_nx_io_cache_mb) failed on the console
  * because of the blocks: only 1 % of the offsets the game asks for are aligned to 256 KB, so it
  * brought 365 KB from the SD for every 110 KB requested (x3.3 amplification) and ended up reading
  * more disk than it saved. Storing the exact range (file, offset, bytes) makes the amplification
@@ -168,21 +168,21 @@ REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
  * Memory: it comes from the host heap (1,024 MB), not from the GPU heap. With ~506 MB for the guest
  * and the thread stacks, 64 MB leaves margin; 128 would not in the pessimistic case.
  */
-REXCVAR_DEFINE_INT32(nfsmw_io_rangos_mb, 64, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_rangos_mb, 64, "Filesystem",
                      "Cache de lecturas por rango exacto, tope total en MB (0 = apagada). 64 = la huella "
                      "medida de una carrera (56,6 MB) sin expulsiones; mas no compra nada.");
 
 // Floor, in KB. At 4 MB it left out everything that is reread during a race (0.14-2.0 MB).
-REXCVAR_DEFINE_INT32(nfsmw_io_rangos_min_kb, 256, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_rangos_min_kb, 256, "Filesystem",
                      "Solo se cachean las lecturas de estos KB o mas. 256 = el punto donde la simulacion "
                      "deja de ganar (con 128 suben las expulsiones y bajan los aciertos).");
 
 // Compatibility: the old cvar in MB. If a toml sets it to a value > 0, it overrides the KB one.
-REXCVAR_DEFINE_INT32(nfsmw_io_rangos_min_mb, 0, "Filesystem",
-                     "OBSOLETO (build 131): usar nfsmw_io_rangos_min_kb. Si es > 0 manda sobre el de KB.");
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_rangos_min_mb, 0, "Filesystem",
+                     "OBSOLETO (build 131): usar ufc3_undisputed_nx_io_rangos_min_kb. Si es > 0 manda sobre el de KB.");
 
 // Per-entry ceiling: a single read cannot take more than this out of the total cap.
-REXCVAR_DEFINE_INT32(nfsmw_io_rangos_max_mb, 12, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_rangos_max_mb, 12, "Filesystem",
                      "Ninguna entrada de la cache de rangos pasa de estos MB.");
 
 namespace rex::filesystem {
@@ -197,7 +197,7 @@ std::atomic<int64_t> g_ventanas_vivas{0};
 // Above this it does not pay off: the request is already large and the window would only add an extra copy.
 constexpr size_t kPeticionMaxFraccion = 4;  // pedido <= ventana/4
 
-/* The read cache (see nfsmw_io_cache_mb). */
+/* The read cache (see ufc3_undisputed_nx_io_cache_mb). */
 constexpr size_t kBloqueCache = 256 * 1024;
 
 struct BloqueCache {
@@ -257,7 +257,7 @@ void PodarCache(size_t limite) {
  */
 bool LeerConCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t byte_offset,
                   size_t* out_bytes_read) {
-  const size_t limite = static_cast<size_t>(REXCVAR_GET(nfsmw_io_cache_mb)) * 1024u * 1024u;
+  const size_t limite = static_cast<size_t>(REXCVAR_GET(ufc3_undisputed_nx_io_cache_mb)) * 1024u * 1024u;
   const size_t pedido = buffer.size();
   if (!limite || !pedido || !id || g_cache_sin_memoria) {
     return false;
@@ -293,7 +293,7 @@ bool LeerConCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t
          * truncates large ones). The loop only stops when a piece returns 0 bytes. Without this,
          * half-filled blocks would be cached and the game would get incomplete data.
          */
-        const int32_t trozo_mb = REXCVAR_GET(nfsmw_io_trozo_mb);
+        const int32_t trozo_mb = REXCVAR_GET(ufc3_undisputed_nx_io_trozo_mb);
         const size_t trozo = trozo_mb > 0 ? static_cast<size_t>(trozo_mb) * 1024u * 1024u : tramo;
         while (leidos < tramo) {
           size_t n = 0;
@@ -363,7 +363,7 @@ bool LeerConCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t
     REXLOG_INFO("[io] cache en RAM: {} bloques ({} MB de {}), {} servidas de RAM y {} del disco "
                 "({:.1f} % de aciertos); {:.1f} MB entregados, {:.1f} leidos de la SD, {} bloques "
                 "expulsados",
-                g_cache.size(), g_cache_bytes >> 20, REXCVAR_GET(nfsmw_io_cache_mb), g_cache_aciertos,
+                g_cache.size(), g_cache_bytes >> 20, REXCVAR_GET(ufc3_undisputed_nx_io_cache_mb), g_cache_aciertos,
                 g_cache_fallos, vueltas ? 100.0 * double(g_cache_aciertos) / double(vueltas) : 0.0,
                 double(g_cache_bytes_servidos) / 1048576.0, double(g_cache_bytes_disco) / 1048576.0,
                 g_cache_expulsados);
@@ -373,7 +373,7 @@ bool LeerConCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t
 
 /*
  * ================================================================================================
- * The exact-range cache. See nfsmw_io_rangos_mb above.
+ * The exact-range cache. See ufc3_undisputed_nx_io_rangos_mb above.
  *
  * The table is a vector and is scanned in full. This is deliberate: it was sized for a 32 MB cap
  * and a 4 MB floor per entry, where at most eight entries fit and the linear search is eight
@@ -417,21 +417,21 @@ std::atomic<uint64_t> g_rangos_secuenciales_mb{0};
 std::unordered_map<uint32_t, uint64_t> g_rangos_ultimo_fin;
 
 int64_t SueloBytes() {
-  const int64_t viejo_mb = REXCVAR_GET(nfsmw_io_rangos_min_mb);
+  const int64_t viejo_mb = REXCVAR_GET(ufc3_undisputed_nx_io_rangos_min_mb);
   if (viejo_mb > 0) {
     return viejo_mb * 1024 * 1024;  // an old toml sets it: honor it
   }
-  return int64_t(REXCVAR_GET(nfsmw_io_rangos_min_kb)) * 1024;
+  return int64_t(REXCVAR_GET(ufc3_undisputed_nx_io_rangos_min_kb)) * 1024;
 }
 
 // Does this read go into the cache? Only the size decides; the constructor already took care of
 // the file being read-only when it gave (or did not give) it an id.
 bool RangoElegible(size_t pedido) {
-  const int64_t tope = int64_t(REXCVAR_GET(nfsmw_io_rangos_mb)) * 1024 * 1024;
+  const int64_t tope = int64_t(REXCVAR_GET(ufc3_undisputed_nx_io_rangos_mb)) * 1024 * 1024;
   if (tope <= 0) {
     return false;
   }
-  const int64_t techo = int64_t(REXCVAR_GET(nfsmw_io_rangos_max_mb)) * 1024 * 1024;
+  const int64_t techo = int64_t(REXCVAR_GET(ufc3_undisputed_nx_io_rangos_max_mb)) * 1024 * 1024;
   if (int64_t(pedido) < SueloBytes()) {
     g_rangos_bajo_suelo.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -529,7 +529,7 @@ void GuardarRango(uint32_t id, uint64_t desplazamiento, uint32_t pedido, const u
     return;
   }
 
-  const size_t tope = size_t(REXCVAR_GET(nfsmw_io_rangos_mb)) * 1024u * 1024u;
+  const size_t tope = size_t(REXCVAR_GET(ufc3_undisputed_nx_io_rangos_mb)) * 1024u * 1024u;
   std::lock_guard lock(g_rangos_mutex);
   for (const auto& e : g_rangos) {
     if (e.id == id && e.desplazamiento == desplazamiento && e.pedido == pedido) {
@@ -576,7 +576,7 @@ EstadisticasRangos LeerEstadisticasRangos() {
   e.secuenciales = g_rangos_secuenciales.load(std::memory_order_relaxed);
   e.secuenciales_bytes = g_rangos_secuenciales_mb.load(std::memory_order_relaxed);
   e.suelo_kb = uint64_t(SueloBytes() / 1024);
-  const int32_t tope = REXCVAR_GET(nfsmw_io_rangos_mb);
+  const int32_t tope = REXCVAR_GET(ufc3_undisputed_nx_io_rangos_mb);
   e.tope_mb = tope > 0 ? uint64_t(tope) : 0;
   {
     std::lock_guard lock(g_rangos_mutex);
@@ -601,7 +601,7 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
     : File(file_access, entry), file_handle_(std::move(file_handle)) {
   // The window is decided once, at open time. Conditions: there is a handle (it is not a directory),
   // the device is read-only, the file was not opened for writing and the cvar allows it.
-  const int32_t kb = REXCVAR_GET(nfsmw_io_ventana_kb);
+  const int32_t kb = REXCVAR_GET(ufc3_undisputed_nx_io_ventana_kb);
   const bool quiere_escribir =
       (file_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
                       FileAccess::kFileAppendData | FileAccess::kGenericAll)) != 0;
@@ -615,11 +615,11 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
    * serving a stale copy would mean a corrupt save.
    */
   if (file_handle_ && entry && entry->is_read_only() && !quiere_escribir &&
-      (REXCVAR_GET(nfsmw_io_cache_mb) > 0 || REXCVAR_GET(nfsmw_io_rangos_mb) > 0)) {
+      (REXCVAR_GET(ufc3_undisputed_nx_io_cache_mb) > 0 || REXCVAR_GET(ufc3_undisputed_nx_io_rangos_mb) > 0)) {
     cache_id_ = IdDeRuta(entry->path());
   }
   if (file_handle_ && kb > 0 && entry && entry->is_read_only() && !quiere_escribir) {
-    const int64_t max = REXCVAR_GET(nfsmw_io_ventanas_max);
+    const int64_t max = REXCVAR_GET(ufc3_undisputed_nx_io_ventanas_max);
     if (g_ventanas_vivas.fetch_add(1, std::memory_order_relaxed) < max) {
       ventana_tam_ = static_cast<size_t>(kb) * 1024u;
       ventana_activa_ = true;
@@ -700,7 +700,7 @@ bool HostPathFile::RellenarVentana(size_t byte_offset, size_t pedido, std::span<
 }
 
 /*
- * The direct read, split into pieces. See nfsmw_io_trozo_mb above.
+ * The direct read, split into pieces. See ufc3_undisputed_nx_io_trozo_mb above.
  *
  * It must return exactly the same as a single pread in every case the game can see: success with
  * whatever count results, and X_STATUS_END_OF_FILE only if the first call really fails.
@@ -708,7 +708,7 @@ bool HostPathFile::RellenarVentana(size_t byte_offset, size_t pedido, std::span<
 X_STATUS HostPathFile::LeerDirecta(std::span<uint8_t> buffer, size_t byte_offset,
                                    size_t* out_bytes_read) {
   const size_t pedido = buffer.size();
-  const int32_t trozo_mb = REXCVAR_GET(nfsmw_io_trozo_mb);
+  const int32_t trozo_mb = REXCVAR_GET(ufc3_undisputed_nx_io_trozo_mb);
   const size_t trozo = trozo_mb > 0 ? static_cast<size_t>(trozo_mb) * 1024u * 1024u : 0;
 
   if (!trozo || pedido <= trozo) {
@@ -789,7 +789,7 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
   }
 
   /*
-   * The exact-range cache, before going to disk. See nfsmw_io_rangos_mb.
+   * The exact-range cache, before going to disk. See ufc3_undisputed_nx_io_rangos_mb.
    *
    * It is the only thing between the game and the SD for large reads: the zone pack that the game
    * releases on leaving and asks for again on entering, byte for byte, at the same place and with
@@ -809,7 +809,7 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     }
   }
 
-  // The RAM cache, before going to disk. See nfsmw_io_cache_mb: the game rereads the same data every
+  // The RAM cache, before going to disk. See ufc3_undisputed_nx_io_cache_mb: the game rereads the same data every
   // lap, and those reads are what make a facade take a while to get its proper texture.
   if (cache_id_ && pedido) {
     size_t leidos = 0;

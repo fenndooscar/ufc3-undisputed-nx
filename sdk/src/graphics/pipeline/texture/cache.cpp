@@ -577,14 +577,34 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
   }
 
+  // A failed texture upload is silent everywhere else: CommitPreparedTextureLoad
+  // returns false, LoadTextureData returns false, and both callers drop the result, so
+  // binding.texture stays a created-but-empty resource that samples as (0, 0, 0, 0). That
+  // is the black/transparent fighter in UFC 3 Undisputed. Cap the reports so a wholesale
+  // failure cannot flood the log.
+  auto report_failed_texture_load = [](const Texture& texture, const char* stage) {
+    static uint32_t reported = 0;
+    if (reported >= 200) {
+      return;
+    }
+    ++reported;
+    const TextureKey& key = texture.key();
+    REXGPU_WARN(
+        "ufc3 sonda: fallo de carga de textura ({}) {} {}x{} {} base=0x{:08X} mips=0x{:08X}",
+        stage, key.tiled ? "tiled" : "linear", key.GetWidth(), key.GetHeight(),
+        FormatInfo::Get(key.format)->name, key.base_page << 12, key.mip_page << 12);
+  };
+
   if (batched_shared_memory_request_succeeded) {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
-      CommitPreparedTextureLoad(pending_load);
+      if (!CommitPreparedTextureLoad(pending_load) && pending_load.texture != nullptr) {
+        report_failed_texture_load(*pending_load.texture, "commit");
+      }
     }
   } else {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
-      if (pending_load.texture != nullptr) {
-        LoadTextureData(*pending_load.texture);
+      if (pending_load.texture != nullptr && !LoadTextureData(*pending_load.texture)) {
+        report_failed_texture_load(*pending_load.texture, "range");
       }
     }
   }

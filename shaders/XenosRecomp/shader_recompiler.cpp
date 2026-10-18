@@ -19,14 +19,14 @@ static constexpr const char* USAGE_TYPES[] =
     "float4", // POSITION
     "float4", // BLENDWEIGHT
     "uint4", // BLENDINDICES
-#ifdef NFSMW_RECOMP
-    "float4", // NORMAL: NFSMW stores them as 16-bit integers or as float
+#ifdef UFC3_UNDISPUTED_NX_RECOMP
+    "float4", // NORMAL: UFC3_UNDISPUTED_NX stores them as 16-bit integers or as float
 #else
     "uint4", // NORMAL
 #endif
     "float4", // PSIZE
     "float4", // TEXCOORD
-#ifdef NFSMW_RECOMP
+#ifdef UFC3_UNDISPUTED_NX_RECOMP
     "float4", // TANGENT
     "float4", // BINORMAL
 #else
@@ -126,8 +126,8 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
     { DeclUsage::TexCoord, 15 },
     { DeclUsage::Color, 0 },
     { DeclUsage::Color, 1 }
-#ifdef NFSMW_RECOMP
-    // NFSMW declares and consumes COLOR2..5 in the original 2005 shaders.
+#ifdef UFC3_UNDISPUTED_NX_RECOMP
+    // UFC3_UNDISPUTED_NX declares and consumes COLOR2..5 in the original 2005 shaders.
     , { DeclUsage::Color, 2 }
     , { DeclUsage::Color, 3 }
     , { DeclUsage::Color, 4 }
@@ -193,8 +193,8 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     if (findResult == vertexElements.end())
         throw std::runtime_error("FETCH de vertices sin elemento declarado");
 
-#ifdef NFSMW_RECOMP
-    // NFSMW: D3D patches the fetch swizzle according to the vertex declaration; the
+#ifdef UFC3_UNDISPUTED_NX_RECOMP
+    // UFC3_UNDISPUTED_NX: D3D patches the fetch swizzle according to the vertex declaration; the
     // native renderer passes the mapping through g_InputRemap.
     int32_t remapLocation = -1;
     for (auto& usageLocation : USAGE_LOCATIONS)
@@ -211,9 +211,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 
     switch (findResult->second.usage)
     {
-    // NFSMW declares normals, tangents and binormals as float4 (USAGE_TYPES): the
+    // UFC3_UNDISPUTED_NX declares normals, tangents and binormals as float4 (USAGE_TYPES): the
     // native renderer supplies them already normalized through the Vulkan format.
-#ifndef NFSMW_RECOMP
+#ifndef UFC3_UNDISPUTED_NX_RECOMP
     case DeclUsage::Normal:
     case DeclUsage::Tangent:
     case DeclUsage::Binormal:
@@ -231,7 +231,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 
     switch (findResult->second.usage)
     {
-#ifndef NFSMW_RECOMP
+#ifndef UFC3_UNDISPUTED_NX_RECOMP
     case DeclUsage::Normal:
     case DeclUsage::Tangent:
     case DeclUsage::Binormal:
@@ -244,7 +244,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         break;
     }
 
-#ifdef NFSMW_RECOMP
+#ifdef UFC3_UNDISPUTED_NX_RECOMP
     if (remapLocation >= 0)
         print("), g_InputRemap({}))", remapLocation);
 #endif
@@ -1003,7 +1003,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluScalarOpcode::SetpInv:
-#ifdef NFSMW_RECOMP
+#ifdef UFC3_UNDISPUTED_NX_RECOMP
             // Xenos: with src == 1 the counter goes back to 0 (Xenia's ucode.h, kSetpInv). Without that
             // case the counter stayed at 1 and later p0 blocks did not run.
             print("p0 ? 0.0 : ({0} == 0.0 ? 1.0 : {0})", op(SCALAR_0));
@@ -1213,14 +1213,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
 
-                // NFSMW: dynamic UBO or pointer, depending on SPEC_CONSTANT_CONSTANTES_UBO.
-                println("#define {}(INDEX) select((INDEX) < {}, (NFSMW_UBO ? g_Ubo{}.v[{} + min(INDEX, {})] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10)), 0.0)",
+                // UFC3_UNDISPUTED_NX: dynamic UBO or pointer, depending on SPEC_CONSTANT_CONSTANTES_UBO.
+                println("#define {}(INDEX) select((INDEX) < {}, (UFC3_UNDISPUTED_NX_UBO ? g_Ubo{}.v[{} + min(INDEX, {})] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10)), 0.0)",
                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1,
                     shaderName, constantInfo->registerIndex.get(), tailCount - 1);
             }
             else
             {
-                println("#define {} (NFSMW_UBO ? g_Ubo{}.v[{}] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10))",
+                println("#define {} (UFC3_UNDISPUTED_NX_UBO ? g_Ubo{}.v[{}] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10))",
                     constantName, shaderName, constantInfo->registerIndex.get(), shaderName, constantInfo->registerIndex * 16);
             }
             
@@ -1234,18 +1234,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
-                println("#define {}_Texture{}DescriptorIndex (NFSMW_UBO ? NFSMW_COMPARTIDA_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+                println("#define {}_Texture{}DescriptorIndex (UFC3_UNDISPUTED_NX_UBO ? UFC3_UNDISPUTED_NX_COMPARTIDA_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
                     constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4, j * 64 + constantInfo->registerIndex * 4);
             }
 
-            println("#define {}_SamplerDescriptorIndex (NFSMW_UBO ? NFSMW_COMPARTIDA_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+            println("#define {}_SamplerDescriptorIndex (UFC3_UNDISPUTED_NX_UBO ? UFC3_UNDISPUTED_NX_COMPARTIDA_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
                 constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
 
             // 1/size of the host image of that slot, which the renderer writes at byte
             // 360 + slot * 8 of the shared constants (right after g_InputRemap).
             {
                 const uint32_t invBase = 360 + constantInfo->registerIndex * 8;
-                println("#define {}_InvTamano (NFSMW_UBO ? float2(NFSMW_COMPARTIDA_FLOAT({}), NFSMW_COMPARTIDA_FLOAT({})) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + {}))",
+                println("#define {}_InvTamano (UFC3_UNDISPUTED_NX_UBO ? float2(UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT({}), UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT({})) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + {}))",
                     constantName, invBase, invBase + 4, invBase);
             }
 
@@ -1324,9 +1324,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
             println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
-            // In NFSMW CTAB numbers b0.. and CF uses 128.. for pixels.
+            // In UFC3_UNDISPUTED_NX CTAB numbers b0.. and CF uses 128.. for pixels.
             // The g_Booleans packing keeps its 16 bits per stage.
-#ifdef NFSMW_RECOMP
+#ifdef UFC3_UNDISPUTED_NX_RECOMP
             boolConstants.emplace(constantInfo->registerIndex + (isPixelShader ? 128 : 0), constantName);
 #else
             boolConstants.emplace(constantInfo->registerIndex, constantName);
@@ -1925,8 +1925,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     out += '{';
 
                     indent();
-                #ifdef NFSMW_RECOMP
-                    // NFSMW: the 8 comparison functions (alphaTestValue, shader_common.h).
+                #ifdef UFC3_UNDISPUTED_NX_RECOMP
+                    // UFC3_UNDISPUTED_NX: the 8 comparison functions (alphaTestValue, shader_common.h).
                     out += "\tclip(alphaTestValue(oC0.w));\n";
                 #else
                     out += "\tclip(oC0.w - g_AlphaThreshold);\n";
@@ -1958,7 +1958,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     if (!hasMtxProjection)
                 #endif
                     {
-                    #ifdef NFSMW_RECOMP
+                    #ifdef UFC3_UNDISPUTED_NX_RECOMP
                         // To host clip space (ndc_scale/ndc_offset from
                         // draw.cpp): draws in pixels with clipping disabled.
                         out += "\toPos.xy = oPos.xy * g_NdcScale + g_NdcOffset * oPos.w;\n";

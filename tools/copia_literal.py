@@ -1,7 +1,7 @@
 """Generates the literal copies of guest functions used by the self-checking guards of the native code.
 
-Some game functions have a native C++ replacement (see app/src/nfsmw_efecto_pasada_nativo.cpp and
-app/src/nfsmw_pegamento_nativo.cpp). Their guards run the native version against a copy of the recompiled original
+Some game functions have a native C++ replacement (see app/src/ufc3-undisputed-nx_efecto_pasada_nativo.cpp and
+app/src/ufc3-undisputed-nx_pegamento_nativo.cpp). Their guards run the native version against a copy of the recompiled original
 in which every outgoing call goes through a recording policy, so both can be compared without side effects. Those
 copies are code translated from the game's executable, so they are not part of this repository: this tool extracts
 them from your own generated code.
@@ -25,28 +25,28 @@ import sys
 # __imp__ prefix that llamadas_directas.py adds)
 COPIES = [
     ('CopiaOriginal', 'sub_82448E80', {
-        'sub_8259B9B8': 'NFSMW_PASADA_LLAMAR(ctx, base, kLiberar);',
-        'sub_8259C150': 'NFSMW_PASADA_LLAMAR(ctx, base, kSombreadorVertices);',
-        'sub_8259BDC0': 'NFSMW_PASADA_LLAMAR(ctx, base, kSombreadorPixeles);',
-    }, 'NFSMW_PASADA_INDIRECTA'),
+        'sub_8259B9B8': 'UFC3_UNDISPUTED_NX_PASADA_LLAMAR(ctx, base, kLiberar);',
+        'sub_8259C150': 'UFC3_UNDISPUTED_NX_PASADA_LLAMAR(ctx, base, kSombreadorVertices);',
+        'sub_8259BDC0': 'UFC3_UNDISPUTED_NX_PASADA_LLAMAR(ctx, base, kSombreadorPixeles);',
+    }, 'UFC3_UNDISPUTED_NX_PASADA_INDIRECTA'),
     ('CopiaFlujos', 'sub_82452690', {
-        'sub_8258D968': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kFlujo);',
-        'sub_8258DA60': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kIndices);',
+        'sub_8258D968': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kFlujo);',
+        'sub_8258DA60': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kIndices);',
     }, None),
     ('CopiaDibujo', 'sub_8244ED58', {
-        'sub_826992F0': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kEfecto);',
-        'sub_82593C50': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kDibujar);',
-        'sub_8244EDF8': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kSegundo);',
-    }, 'NFSMW_PEGAMENTO_INDIRECTA'),
+        'sub_826992F0': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kEfecto);',
+        'sub_82593C50': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kDibujar);',
+        'sub_8244EDF8': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kSegundo);',
+    }, 'UFC3_UNDISPUTED_NX_PEGAMENTO_INDIRECTA'),
     ('CopiaPegamento', 'sub_82452730', {
-        'sub_8244EA48': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kCambioEstado);',
-        'sub_82453E20': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kVistaE20);',
-        'sub_82453D60': 'NFSMW_PEGAMENTO_LLAMAR(ctx, base, kVistaD60);',
-        'sub_82452690': 'NFSMW_PEGAMENTO_FLUJOS(ctx, base);',
-        'sub_8244ED58': 'NFSMW_PEGAMENTO_DIBUJO(ctx, base);',
+        'sub_8244EA48': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kCambioEstado);',
+        'sub_82453E20': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kVistaE20);',
+        'sub_82453D60': 'UFC3_UNDISPUTED_NX_PEGAMENTO_LLAMAR(ctx, base, kVistaD60);',
+        'sub_82452690': 'UFC3_UNDISPUTED_NX_PEGAMENTO_FLUJOS(ctx, base);',
+        'sub_8244ED58': 'UFC3_UNDISPUTED_NX_PEGAMENTO_DIBUJO(ctx, base);',
     }, None),
     ('CopiaBucle', 'sub_82454B50', {
-        'sub_82452730': 'NFSMW_BUCLE_LLAMAR(ctx, base);',
+        'sub_82452730': 'UFC3_UNDISPUTED_NX_BUCLE_LLAMAR(ctx, base);',
     }, None),
 ]
 

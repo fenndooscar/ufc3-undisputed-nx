@@ -2,7 +2,7 @@
 
 Two files that make SaltyNX work with a homebrew program (.nro): Status Monitor Overlay (and its forks, such as
 Horizon OC Monitor) shows its FPS and resolution, and ReverseNX-RT can switch it between handheld and docked mode.
-They only need [libnx](https://github.com/switchbrew/libnx), and they are the same code NFSMW-NX uses
+They only need [libnx](https://github.com/switchbrew/libnx), and they are the same code UFC3_UNDISPUTED_NX-NX uses
 (`sdk/src/ui/switch_saltynx.cpp`), without anything specific to this project.
 
 How it works, step by step: [docs/console-overlays.md](../../docs/console-overlays.md).
@@ -39,4 +39,4 @@ with `freopen`) to see which port connected, or why it failed.
 
 ## License
 
-GPL-3.0, like the rest of NFSMW-NX.
+GPL-3.0, like the rest of UFC3_UNDISPUTED_NX-NX.

@@ -330,7 +330,7 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
 }
 
 /*
- * NFSMW: silence watchdog, measurement only.
+ * UFC3_UNDISPUTED_NX: silence watchdog, measurement only.
  *
  * In one recording, after braking in a corner, the engine acceleration sound takes ~2.5 s to come
  * back, coinciding with a zone load. If the voice that goes quiet is XMA, it shows here: every time
@@ -1063,7 +1063,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     VolcarXma(id(), 0, GetSampleRate(data->sample_rate), data->is_stereo ? 2 : 1, raw_frame_.data(),
               size_t(kBytesPerFrameChannel) << data->is_stereo);
 
-    // NFSMW discards 384 samples at the start of each sound in sub_825E1CD0.
+    // UFC3_UNDISPUTED_NX discards 384 samples at the start of each sound in sub_825E1CD0.
     // Deliver the decoder's whole block: shifting it by 192 samples and holding
     // its tail until the next frame also dropped a final block of 512. The
     // consumer ran out of input and waited forever.

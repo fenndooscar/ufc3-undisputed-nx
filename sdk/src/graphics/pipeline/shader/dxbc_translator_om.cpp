@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstdint>
 
 #include <rex/assert.h>
@@ -1530,10 +1531,108 @@ void DxbcShaderTranslator::ROV_HandleAlphaBlendFactorCases(uint32_t src_temp, ui
   a_.OpBreak();
 }
 
+// SONDA TEMPORAL: fuerza el color de salida del shader de pixeles. Quitar cuando el
+// cuerpo negro del luchador creado este localizado.
+//   0 = apagado
+//   1 = magenta, solo el PS del CAF (hash 1DC39A2F7A50049F)
+//   2 = blanco, solo el del CAF
+//   3 = magenta, TODOS (control de que el gancho esta puesto)
+//   4 = temporary hash colours for cube-lit materials; a runtime system flag
+//       follows capturas/sonda_tinte_on, so navigation and post-processing work.
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_sonda_tinte, 0, "UFC3_UNDISPUTED_NX",
+                     "Fuerza el color del shader de pixeles (0 apagado, 1/2/3 pruebas, "
+                     "4 color por hash; solo pruebas)")
+    .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// ponytail: legacy modes 1-3 evaluate this delay at translation time; mode 4
+// uses the runtime flag above to tag already compiled material shaders.
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_sonda_tinte_tras_s, 0, "UFC3_UNDISPUTED_NX",
+                     "Segundos de juego antes de encender el tinte (0 = inmediato; solo pruebas)")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
   uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
   if (!shader_writes_color_targets) {
     return;
+  }
+
+  // SONDA TEMPORAL: fuerza el color que sale del shader de pixeles del luchador creado.
+  // Es la unica medida que separa "el negro viene de dentro del shader" de "el negro se
+  // aplica despues del shader" (mezcla contra el destino, o un segundo pase encima):
+  // si con el color forzado a magenta el cuerpo sigue negro, el shader no es el culpable;
+  // si sale magenta, el negro esta en lo que el shader LEE.
+  //   0 = apagado
+  //   1 = magenta opaco, solo el shader de pixeles del CAF (hash 1DC39A2F7A50049F)
+  //   2 = blanco opaco, solo el del CAF
+  //   3 = magenta opaco, TODOS los shaders de pixeles (control: comprueba que el gancho
+  //       esta puesto, la pantalla entera tiene que salir magenta)
+  const int32_t sonda_tinte = REXCVAR_GET(ufc3_undisputed_nx_sonda_tinte);
+  if (sonda_tinte == 4) {
+    // Identify lit materials after navigation, without tinting post-processing.
+    const bool lit = std::any_of(texture_bindings_.begin(), texture_bindings_.end(),
+                                [](const TextureBinding& binding) {
+                                  return binding.dimension == xenos::FetchOpDimension::kCube;
+                                });
+    if (lit) {
+      const uint64_t hash = current_shader().ucode_data_hash();
+      const uint32_t temp = PushSystemTemp();
+      a_.OpAnd(dxbc::Dest::R(temp, 0b0001), LoadFlagsSystemConstant(),
+               dxbc::Src::LU(kSysFlag_DiagnosticTint));
+      a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kXXXX));
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (shader_writes_color_targets & (1 << i)) {
+          a_.OpMov(dxbc::Dest::R(system_temps_color_[i]),
+                   dxbc::Src::LF(float(hash & 63) / 63.0f,
+                                 float((hash >> 6) & 63) / 63.0f,
+                                 float((hash >> 12) & 63) / 63.0f, 1.0f));
+        }
+      }
+      a_.OpEndIf();
+      PopSystemTemp();
+      REXLOG_WARN("[GPU-material-tag] PS={:016X} RGB={},{},{}", hash,
+                  uint32_t(hash & 63), uint32_t((hash >> 6) & 63),
+                  uint32_t((hash >> 12) & 63));
+    }
+  } else if (sonda_tinte != 0) {
+    const uint64_t shader_hash = current_shader().ucode_data_hash();
+    const bool es_caf = shader_hash == 0x1DC39A2F7A50049Full;
+    // El tinte por hash pinta TODA la pantalla, menus incluidos, y con el no se puede
+    // navegar hasta la pelea. Con el retardo se arranca limpio, se navega, y el tinte se
+    // enciende solo cuando ya se pelea. El reloj se pone en la primera traduccion, que es
+    // al arrancar.
+    static std::atomic<int64_t> instante_inicial{-1};
+    int64_t t0 = instante_inicial.load(std::memory_order_relaxed);
+    if (t0 < 0) {
+      const int64_t ahora = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+      instante_inicial.compare_exchange_strong(t0, ahora, std::memory_order_relaxed);
+      t0 = instante_inicial.load(std::memory_order_relaxed);
+    }
+    const int64_t instante = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+    const int32_t tras_s = REXCVAR_GET(ufc3_undisputed_nx_sonda_tinte_tras_s);
+    const bool encendido = (tras_s <= 0) || (instante - t0 >= tras_s);
+    // Una linea por compilacion, para que el resultado de la pantalla se pueda leer sin
+    // dudas: si esta linea no aparece, el gancho no llego a ponerse y la pantalla no
+    // cambia por eso, no porque el shader no sea el culpable.
+    REXLOG_WARN("[SONDA-tinte] PS={:016X} caf={} modo={} tras={}s llevo={}s aplicado={}",
+                shader_hash, es_caf ? 1 : 0, sonda_tinte, tras_s, instante - t0,
+                (encendido && (sonda_tinte == 3 || es_caf || sonda_tinte == 4)) ? 1 : 0);
+    if (encendido && (sonda_tinte == 3 || es_caf || sonda_tinte == 4)) {
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!(shader_writes_color_targets & (1 << i))) {
+          continue;
+        }
+        if (sonda_tinte == 2) {
+          a_.OpMov(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::LF(1.0f, 1.0f, 1.0f, 1.0f));
+        } else {
+          a_.OpMov(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::LF(1.0f, 0.0f, 1.0f, 1.0f));
+        }
+      }
+    }
   }
 
   uint32_t gamma_temp = PushSystemTemp();

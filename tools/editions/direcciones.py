@@ -2,7 +2,7 @@
 # Lists every guest address (0x82xxxxxx) that an application tree uses, one per line, for emparejar.py.
 #
 # A tree uses addresses in several places: its sources (hooks, overrides and constants), the code generator settings
-# (nfsmw.toml, overrides.toml, huecos.toml, generated/rexglue.cmake), the linker order (orden_funciones.ld), the
+# (ufc3-undisputed-nx.toml, overrides.toml, huecos.toml, generated/rexglue.cmake), the linker order (orden_funciones.ld), the
 # function partition of the code generator (generated/default/codegen.partition.json) and the weak calls of the
 # generated code. The partition and the generated code only exist after running the code generator on the tree, so
 # generate the reference tree first.
@@ -37,7 +37,7 @@ def main():
         for name in files:
             if name.endswith(('.cpp', '.h', '.hpp', '.inl', '.c')) and not name.endswith(BINARY):
                 scan(open(os.path.join(folder, name), encoding='utf-8').read())
-    for rel in ('CMakeLists.txt', 'nfsmw.toml', 'orden_funciones.ld', 'overrides.toml', 'huecos.toml',
+    for rel in ('CMakeLists.txt', 'ufc3-undisputed-nx.toml', 'orden_funciones.ld', 'overrides.toml', 'huecos.toml',
                 os.path.join('generated', 'rexglue.cmake')):
         path = os.path.join(tree, rel)
         if os.path.exists(path):
@@ -47,7 +47,7 @@ def main():
     if not os.path.exists(partition):
         sys.exit('%s not found: run the code generator on %s first' % (partition, tree))
     found.update(int(a, 16) for a in json.load(open(partition))['assignments'])
-    for path in glob.glob(os.path.join(tree, 'generated', 'default', 'nfsmw_recomp.*.cpp')):
+    for path in glob.glob(os.path.join(tree, 'generated', 'default', 'ufc3-undisputed-nx_recomp.*.cpp')):
         found.update(int(x, 16) for x in WEAK_CALL.findall(open(path, encoding='utf-8').read()))
 
     for address in sorted(found):

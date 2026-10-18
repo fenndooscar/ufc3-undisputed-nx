@@ -26,6 +26,7 @@
 #include <rex/memory.h>
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/xthread.h>
+#include <rex/thread.h>
 #include <rex/thread/mutex.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/presenter.h>
@@ -75,6 +76,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
 
   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
+  void QueueInterruptCallback(uint32_t cpu);
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
   virtual void ClearCaches();
@@ -107,6 +109,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void WriteRegister(uint32_t addr, uint32_t value);
 
   void MarkVblank();
+  void DispatchPendingInterrupts();
 
   memory::Memory* memory_ = nullptr;
   runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
@@ -130,6 +133,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<::rex::ui::Presenter> presenter_;
 
   std::atomic_flag host_gpu_loss_reported_;
+  // Wake the existing VSync worker for command IRQs independently of vblank.
+  std::atomic<uint32_t> pending_interrupt_cpus_{0};
+  std::unique_ptr<thread::Event> interrupt_event_ = thread::Event::CreateAutoResetEvent(false);
 };
 
 }  // namespace rex::graphics

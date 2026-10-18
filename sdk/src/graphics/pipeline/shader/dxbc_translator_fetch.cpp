@@ -30,6 +30,44 @@ REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
 namespace rex::graphics {
 using namespace ucode;
 
+void DxbcShaderTranslator::RestoreTexture16UnsignedInteger(
+    uint32_t fetch_index, uint32_t components, uint32_t signs_temp, bool point_sampled) {
+  // Filterable host SRVs normalize fixed-point data. UFC's BC3 address table
+  // uses k_16 with num_format=integer: sampling 1023 as 1023/65535 aliases its
+  // memexport destinations. Restore the range before bias and exponent adjustment.
+  uint32_t temp = PushSystemTemp();
+  a_.OpUBFE(dxbc::Dest::R(temp, 0b0001), dxbc::Src::LU(6), dxbc::Src::LU(0),
+            RequestTextureFetchConstantWord(fetch_index, 1));
+  // The three fixed-point 16-bit formats are consecutive; exclude float formats.
+  a_.OpIAdd(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX),
+             dxbc::Src::LI(-int32_t(xenos::TextureFormat::k_16)));
+  a_.OpULT(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX), dxbc::Src::LU(3));
+  a_.OpAnd(dxbc::Dest::R(temp, 0b0010), RequestTextureFetchConstantWord(fetch_index, 3),
+            dxbc::Src::LU(1));
+  a_.OpAnd(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX),
+            dxbc::Src::R(temp, dxbc::Src::kYYYY));
+  a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kXXXX));
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!(components & (1u << i))) continue;
+    // Constant 0/1 channels and signed/biased/gamma conversions keep their semantics.
+    a_.OpUBFE(dxbc::Dest::R(temp, 0b0001), dxbc::Src::LU(3), dxbc::Src::LU(1 + 3 * i),
+              RequestTextureFetchConstantWord(fetch_index, 3));
+    a_.OpULT(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX), dxbc::Src::LU(4));
+    a_.OpIEq(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(signs_temp).Select(i),
+              dxbc::Src::LU(uint32_t(xenos::TextureSign::kUnsigned)));
+    a_.OpAnd(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX),
+              dxbc::Src::R(temp, dxbc::Src::kYYYY));
+    a_.OpIf(true, dxbc::Src::R(temp, dxbc::Src::kXXXX));
+    dxbc::Dest dest(dxbc::Dest::R(system_temp_result_, 1u << i));
+    dxbc::Src value(dxbc::Src::R(system_temp_result_).Select(i));
+    a_.OpMul(dest, value, dxbc::Src::LF(65535.0f));
+    if (point_sampled) a_.OpRoundNE(dest, value);
+    a_.OpEndIf();
+  }
+  a_.OpEndIf();
+  PopSystemTemp();
+}
+
 void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
   if (emit_source_map_) {
@@ -165,7 +203,9 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   if (uav_index_shared_memory_ == kBindingIndexUnallocated) {
     uav_index_shared_memory_ = uav_count_++;
   }
+  const dxbc::Src first_address_src = address_src;
   for (uint32_t i = 0; i < 2; ++i) {
+    address_src = first_address_src;
     if (i) {
       a_.OpElse();
     }
@@ -494,7 +534,7 @@ uint32_t DxbcShaderTranslator::FindOrAddTextureBinding(uint32_t fetch_constant,
   new_texture_binding.bindful_srv_rdef_name_ptr = 0;
   // Consistently 0 if not bindless as it may be used for hashing.
   new_texture_binding.bindless_descriptor_index =
-      bindless_resources_used_ ? GetBindlessResourceCount() : 0;
+      bindless_resources_used_ ? GetBindlessResourceCount() - 1 : 0;
   new_texture_binding.fetch_constant = fetch_constant;
   new_texture_binding.dimension = dimension;
   new_texture_binding.is_signed = is_signed;
@@ -530,7 +570,7 @@ uint32_t DxbcShaderTranslator::FindOrAddSamplerBinding(uint32_t fetch_constant,
   SamplerBinding& new_sampler_binding = sampler_bindings_.emplace_back();
   // Consistently 0 if not bindless as it may be used for hashing.
   new_sampler_binding.bindless_descriptor_index =
-      bindless_resources_used_ ? GetBindlessResourceCount() : 0;
+      bindless_resources_used_ ? GetBindlessResourceCount() - 1 : 0;
   new_sampler_binding.fetch_constant = fetch_constant;
   new_sampler_binding.mag_filter = mag_filter;
   new_sampler_binding.min_filter = min_filter;
@@ -1921,6 +1961,12 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // sampler filtering).
     if (instr.opcode == FetchOpcode::kTextureFetch) {
       assert_true(signs_temp != UINT32_MAX);
+      RestoreTexture16UnsignedInteger(
+          tfetch_index, used_result_nonzero_components, signs_temp,
+          instr.attributes.mag_filter == xenos::TextureFilter::kPoint &&
+              instr.attributes.min_filter == xenos::TextureFilter::kPoint &&
+              (instr.attributes.mip_filter == xenos::TextureFilter::kPoint ||
+               instr.attributes.mip_filter == xenos::TextureFilter::kBaseMap));
       for (uint32_t i = 0; i < 4; ++i) {
         if (!(used_result_nonzero_components & (1 << i))) {
           continue;

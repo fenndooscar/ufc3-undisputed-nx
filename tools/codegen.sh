@@ -14,7 +14,7 @@ REXGLUE=${REXGLUE:?set REXGLUE to the rexglue executable built from sdk/}
 PY=${PYTHON:-python}
 cd "$APP"
 echo "== codegen ($APP)"
-"$REXGLUE" codegen nfsmw_manifest.toml > codegen.log 2>&1 || { echo "codegen failed, see $APP/codegen.log"; exit 1; }
+"$REXGLUE" codegen ufc3_undisputed_nx_manifest.toml > codegen.log 2>&1 || { echo "codegen failed, see $APP/codegen.log"; exit 1; }
 cd "$RAIZ"
 echo "== direct calls"
 if [ -n "${2:-}" ]; then

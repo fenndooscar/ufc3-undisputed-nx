@@ -148,7 +148,10 @@ bool CommandProcessor::Initialize() {
 }
 
 void CommandProcessor::Shutdown() {
-  worker_running_ = false;
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    worker_running_ = false;
+  }
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
@@ -157,15 +160,59 @@ void CommandProcessor::Shutdown() {
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                uint32_t title_id, bool blocking) {}
 
+bool CommandProcessor::QueueInThread(std::function<void()> fn) {
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    if (!worker_running_) {
+      return false;
+    }
+    pending_fns_.push(std::move(fn));
+  }
+  write_ptr_index_event_->Set();
+  return true;
+}
+
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  if (system::XThread::IsInThread(worker_thread_.get())) {
     fn();
   } else {
-    pending_fns_.push(std::move(fn));
-#if REX_PLATFORM_SWITCH
-    // Also wake up for internal work, even if the ring does not change.
-    write_ptr_index_event_->Set();
-#endif
+    QueueInThread(std::move(fn));
+  }
+}
+
+bool CommandProcessor::CallInThreadAndWait(std::function<bool()> fn) {
+  if (system::XThread::IsInThread(worker_thread_.get())) {
+    return fn();
+  }
+  thread::Fence fence;
+  bool result = false;
+  if (!QueueInThread([&]() {
+        result = fn();
+        fence.Signal();
+      })) {
+    return false;
+  }
+  fence.Wait();
+  return result;
+}
+
+bool CommandProcessor::HasPendingFunctions() {
+  std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+  return !pending_fns_.empty();
+}
+
+void CommandProcessor::ProcessPendingFunctions() {
+  for (;;) {
+    std::function<void()> fn;
+    {
+      std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+      if (pending_fns_.empty()) {
+        return;
+      }
+      fn = std::move(pending_fns_.front());
+      pending_fns_.pop();
+    }
+    fn();
   }
 }
 
@@ -208,11 +255,7 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      fn();
-    }
+    ProcessPendingFunctions();
 
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
@@ -240,11 +283,13 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
 #endif
+        // A fence wakeup may publish completion words without new ring data.
+        PrepareForWait();
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && !HasPendingFunctions() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || HasPendingFunctions()) {
         continue;
       }
     }
@@ -256,14 +301,19 @@ void CommandProcessor::WorkerThreadMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       read_ptr_index_);
+      // Ring progress is CPU metadata, not a GPU completion event. The protected
+      // alias preserves any GPU-owned neighbors before invalidating this page.
+      memory::store_and_swap<uint32_t>(
+          memory_->TranslateVirtual(0xA0000000u | (read_ptr_writeback_ptr_ & 0x1FFFFFFFu)),
+          read_ptr_index_);
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
   }
 
+  // All accepted CPU-provider requests complete before their contexts die.
+  ProcessPendingFunctions();
   ShutdownContext();
 }
 
@@ -378,7 +428,10 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      // Scratch writeback reports CP progress, unlike a shader-done event.
+      // Deferring it to a GPU fence can overwrite a newer CPU acknowledgement.
+      memory::store(memory_->TranslateVirtual(0xA0000000u | (mem_addr & 0x1FFFFFFFu)),
+                    rex::byte_swap(value));
     }
   } else {
     switch (index) {
@@ -580,6 +633,11 @@ void CommandProcessor::WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t
   WriteRegistersFromMem(start_index + 0x2000, base, num_registers);
 }
 
+bool CommandProcessor::WriteGpuMemory(uint32_t address, uint32_t value) {
+  memory::store(memory_->TranslatePhysical(address), value);
+  return true;
+}
+
 void CommandProcessor::MakeCoherent() {
   SCOPE_profile_cpu_f("gpu");
 
@@ -628,7 +686,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+  // The parser is a CPU consumer too: a GPU-generated packet page must fault
+  // through the same data provider as a guest A/C/E read.
+  memory::RingBuffer reader(
+      memory_->TranslateVirtual(0xA0000000u | (primary_buffer_ptr_ & 0x1FFFFFFFu)), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
 
@@ -681,8 +742,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       // The ring wraps around, so the subtraction is masked with the size.
       const uint32_t avanzado = (ahora - publicado) & (palabras_anillo - 1);
       if (avanzado >= paso) {
-        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                         ahora);
+        memory::store_and_swap<uint32_t>(
+            memory_->TranslateVirtual(0xA0000000u | (read_ptr_writeback_ptr_ & 0x1FFFFFFFu)), ahora);
         publicado = ahora;
       }
     }
@@ -697,7 +758,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+  memory::RingBuffer reader(memory_->TranslateVirtual(0xA0000000u | (ptr & 0x1FFFFFFFu)),
+                            count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
@@ -711,7 +773,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+  memory::RingBuffer reader(memory_->TranslateVirtual(0xA0000000u | (ptr & 0x1FFFFFFFu)),
+                            count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
@@ -723,6 +786,9 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if (HasPendingFunctions()) {
+    ProcessPendingFunctions();
+  }
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -979,7 +1045,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
-        graphics_system_->DispatchInterruptCallback(1, n);
+        graphics_system_->QueueInterruptCallback(n);
       }
     }
   }
@@ -1053,8 +1119,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   do {
     uint32_t value = 0;
     if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      value = memory::load<uint32_t>(memory_->TranslateVirtual(
+          0xA0000000u | (poll_reg_addr & 0x1FFFFFFCu)));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
@@ -1090,15 +1156,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      // A CPU thread supplying this wait word may itself be faulting on a
+      // GPU-written page. Service its provider before waiting for the guest.
+      ProcessPendingFunctions();
+      if (!worker_running_) {
+        return false;
+      }
+      // Flush pending completion notifications even for short guest polls.
+      PrepareForWait();
       // Wait.
       if (wait >= 0x100) {
-        PrepareForWait();
-        if (!REXCVAR_GET(vsync)) {
-          // User wants it fast and dangerous.
-          rex::thread::MaybeYield();
-        } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
-        }
+        // Command-memory handshakes are independent of display VSync. A host
+        // millisecond sleep can overshoot an entire frame on Windows.
+        rex::thread::MaybeYield();
         rex::thread::SyncMemory();
         ReturnFromWait();
 
@@ -1108,6 +1178,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
       } else {
         rex::thread::MaybeYield();
+        ReturnFromWait();
       }
     }
   } while (!matched);
@@ -1154,9 +1225,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
-
-  return true;
+  return WriteGpuMemory(mem_addr, reg_val);
 }
 
 bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
@@ -1168,7 +1237,9 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    if (!WriteGpuMemory(addr, write_data)) {
+      return false;
+    }
     write_addr += 4;
   }
 
@@ -1189,7 +1260,8 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
     // Memory.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
-    value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
+    value = memory::load<uint32_t>(
+        memory_->TranslateVirtual(0xA0000000u | (poll_reg_addr & 0x1FFFFFFFu)));
     value = GpuSwap(value, endianness);
   } else {
     // Register.
@@ -1229,7 +1301,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      return WriteGpuMemory(write_reg_addr, write_data);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1273,9 +1345,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   }
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
-  data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
-  return true;
+  return WriteGpuMemory(address, GpuSwap(data_value, endianness));
 }
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
@@ -1301,8 +1371,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
       1,                                         // max z
   };
   assert_true(endianness == xenos::Endian::k8in16);
-  memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
-                                     rex::countof(extents));
+  for (uint32_t i = 0; i < rex::countof(extents); i += 2) {
+    uint32_t word;
+    std::memcpy(&word, extents + i, sizeof(word));
+    if (!WriteGpuMemory(address + i * sizeof(uint16_t), GpuSwap(word, endianness))) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -1320,8 +1395,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   // As a workaround report some fixed amount of passed samples.
   auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
   if (fake_sample_count >= 0) {
-    auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+    auto* pSampleCounts = memory_->TranslateVirtual<xe_gpu_depth_sample_counts*>(
+        0xA0000000u | (register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR] & 0x1FFFFFFFu));
     if (!pSampleCounts) {
       return true;
     }
@@ -1539,7 +1614,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
-  uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
+  uint32_t* xlat_address = memory_->TranslateVirtual<uint32_t*>(0xA0000000u | (address & 0x1FFFFFFFu));
   switch (type) {
     case 0:  // ALU
       WriteALURangeFromMem(index, xlat_address, size_dwords);
@@ -1584,8 +1659,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
-  auto shader =
-      LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+  auto shader = LoadShader(shader_type, addr,
+                           memory_->TranslateVirtual<uint32_t*>(0xA0000000u | (addr & 0x1FFFFFFFu)),
+                           size_dwords);
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;

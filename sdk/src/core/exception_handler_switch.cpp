@@ -330,7 +330,7 @@ __asm__(".text\n"
         ".size RexExceptionReturnEntry, .-RexExceptionReturnEntry\n");
 
 /*
- * NFSMW's first boot went back to the HOME menu right after creating the GPU threads: no error on
+ * UFC3_UNDISPUTED_NX's first boot went back to the HOME menu right after creating the GPU threads: no error on
  * screen, no Atmosphere report and the log cut off abruptly. The previous stop (a brk inside the
  * handler, with the data in x24..x27 for the report) left nothing to read. So the fault is written
  * right here, to <NRO folder>/logs/rex/rex_crash.log.

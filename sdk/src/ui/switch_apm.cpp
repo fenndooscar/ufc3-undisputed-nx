@@ -1,5 +1,5 @@
 /*
- * nfsmw - console performance profile (apm).
+ * ufc3-undisputed-nx - console performance profile (apm).
  *
  * Why
  *   The GPU runs at 307.2 MHz in handheld mode and it is one of the two walls of the port (the other
@@ -48,7 +48,7 @@
  *
  *   It only ever lowers back to what the console had at the start: nothing is ever raised above
  *   that. And if this firmware did not have the "high GPU + unchanged RAM" pair, the GPU is left
- *   as it was rather than raising the RAM; nfsmw_switch_ram_1600 opts into that trade.
+ *   as it was rather than raising the RAM; ufc3_undisputed_nx_switch_ram_1600 opts into that trade.
  */
 
 #include "rex/ui/switch_apm.h"
@@ -264,7 +264,7 @@ extern "C" void RexSwitchApmAplicar(void) {
     if (gpu_subio && memoria_quieta) {
       if (!quieta_de_verdad) {
         std::fprintf(stderr,
-                     "[apm] 0x%08X sube la memoria a %.1f MHz, pero nfsmw_switch_ram_1600 esta en "
+                     "[apm] 0x%08X sube la memoria a %.1f MHz, pero ufc3_undisputed_nx_switch_ram_1600 esta en "
                      "true: se acepta y NO se vigila la memoria\n",
                      c.config, double(emc1) / 1e6);
         std::fprintf(stderr, "[apm] PUESTA 0x%08X: GPU %.1f MHz (era %.1f), memoria %.1f MHz\n",
@@ -295,7 +295,7 @@ extern "C" void RexSwitchApmAplicar(void) {
    * the EMC of the active apm configuration, and clkrst cannot fight that.
    *
    * So the console is left as it was, and the log says exactly what trade is available and how to
-   * take it (nfsmw_switch_ram_1600).
+   * take it (ufc3_undisputed_nx_switch_ram_1600).
    */
   if (hay_original && R_SUCCEEDED(apmSetPerformanceConfiguration(modo, config_original))) {
     u32 gpu2 = 0, emc2 = 0;
@@ -304,7 +304,7 @@ extern "C" void RexSwitchApmAplicar(void) {
                  "[apm] este firmware NO tiene ninguna configuracion de %d MHz que deje la memoria "
                  "en %.1f MHz; se vuelve a la original 0x%08X (GPU %.1f MHz, memoria %.1f MHz).\n"
                  "[apm] SI PREFIERES LA GPU ALTA AUNQUE LA RAM SUBA A 1600: pon "
-                 "nfsmw_switch_ram_1600 = true en nfsmw.toml\n",
+                 "ufc3_undisputed_nx_switch_ram_1600 = true en ufc3-undisputed-nx.toml\n",
                  mhz, double(emc0) / 1e6, config_original, double(gpu2) / 1e6, double(emc2) / 1e6);
   } else {
     std::fprintf(stderr, "[apm] ninguna configuracion de %d MHz sirvio y NO se pudo restaurar la "

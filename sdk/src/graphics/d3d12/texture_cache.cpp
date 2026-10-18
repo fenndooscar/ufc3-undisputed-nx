@@ -843,6 +843,30 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
       }
     }
   }
+  // Sonda temporal (ufc3): lo mismo para el camino con tabla de descriptores, en
+  // caso de que el backend no use bindless.
+  {
+    static uint32_t veces[32] = {};
+    static uint32_t nulas = 0;
+    const bool es_nula = descriptor_index == UINT32_MAX;
+    if (fetch_constant_index < 32 && (veces[fetch_constant_index] < 4 || (es_nula && nulas < 100))) {
+      ++veces[fetch_constant_index];
+      if (es_nula) {
+        ++nulas;
+      }
+      REXGPU_WARN(
+          "ufc3 sonda: tf{} nula={} enlace={} compatible={} dimShader={} dimTextura={} "
+          "descriptor={:08X} vez={}",
+          fetch_constant_index, es_nula ? 1 : 0, binding != nullptr ? 1 : 0,
+          (binding != nullptr &&
+           AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension))
+              ? 1
+              : 0,
+          uint32_t(host_shader_binding.dimension),
+          binding != nullptr ? uint32_t(binding->key.dimension) : 0xFFFFFFFFu, descriptor_index,
+          veces[fetch_constant_index]);
+    }
+  }
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   D3D12_CPU_DESCRIPTOR_HANDLE source_handle;
   if (descriptor_index != UINT32_MAX) {
@@ -908,6 +932,38 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
                                                        : d3d12_binding.descriptor_index;
     }
   }
+  // Sonda temporal (ufc3): dice si el muestreo acaba en la textura nula y por
+  // que. Una textura nula devuelve (0,0,0,0): negro si el color se multiplica
+  // por el, transparente si el alfa sale de ahi. Se registran las cuatro
+  // primeras veces de cada indice (para ver si cambia entre escenas) y todas
+  // las que acaban en nula.
+  {
+    static uint32_t veces[32] = {};
+    static uint32_t nulas = 0;
+    const bool es_nula = descriptor_index == UINT32_MAX;
+    if (fetch_constant_index < 32 && (veces[fetch_constant_index] < 4 || (es_nula && nulas < 100))) {
+      ++veces[fetch_constant_index];
+      if (es_nula) {
+        ++nulas;
+      }
+      REXGPU_WARN(
+          "ufc3 sonda(bindless): tf{} nula={} enlace={} compatible={} dimShader={} "
+          "dimTextura={} descriptor={:08X} vez={} objeto={} signs={:02X} firmado={} descSin={:08X} "
+          "descCon={:08X}",
+          fetch_constant_index, es_nula ? 1 : 0, binding != nullptr ? 1 : 0,
+          (binding != nullptr &&
+           AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension))
+              ? 1
+              : 0,
+          uint32_t(host_shader_binding.dimension),
+          binding != nullptr ? uint32_t(binding->key.dimension) : 0xFFFFFFFFu, descriptor_index,
+          veces[fetch_constant_index], binding != nullptr && binding->texture != nullptr ? 1 : 0,
+          binding != nullptr ? uint32_t(binding->swizzled_signs) : 0xFFFFFFFFu,
+          host_shader_binding.is_signed ? 1 : 0,
+          d3d12_texture_bindings_[fetch_constant_index].descriptor_index,
+          d3d12_texture_bindings_[fetch_constant_index].descriptor_index_signed);
+    }
+  }
   if (descriptor_index == UINT32_MAX) {
     switch (host_shader_binding.dimension) {
       case xenos::FetchOpDimension::k3DOrStacked:
@@ -923,6 +979,156 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
     }
   }
   return descriptor_index;
+}
+
+bool D3D12TextureCache::QueueActiveTextureReadback(
+    uint32_t fetch_constant, Microsoft::WRL::ComPtr<ID3D12Resource>& readback,
+    D3D12_RESOURCE_DESC& description,
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>& layouts, uint64_t& total_bytes) {
+  if (fetch_constant >= xenos::kTextureFetchConstantCount) {
+    REXGPU_WARN("ufc3 texture readback: invalid fetch constant {}", fetch_constant);
+    return false;
+  }
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
+  if (!binding || !binding->texture ||
+      !texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
+    REXGPU_WARN("ufc3 texture readback: fc={} has no active unsigned binding", fetch_constant);
+    return false;
+  }
+  D3D12Texture* texture = static_cast<D3D12Texture*>(binding->texture);
+  Microsoft::WRL::ComPtr<ID3D12Resource> source = texture->resource();
+  if (!source) {
+    REXGPU_WARN("ufc3 texture readback: fc={} has no GPU resource", fetch_constant);
+    return false;
+  }
+  const D3D12_RESOURCE_DESC desc = source->GetDesc();
+  const uint32_t descriptor_index = d3d12_texture_bindings_[fetch_constant].descriptor_index;
+  REXGPU_WARN(
+      "ufc3 texture readback: fc={} base={:08X} mip_base={:08X} resource={} "
+      "host_format={} unsigned_srv_format={} dimension={} guest_dimension={} "
+      "width={} height={} array_size={} mips={} samples={} host_swizzle={:03X} "
+      "signs={:02X} unsigned_descriptor_index={:08X} bindless={}",
+      fetch_constant, binding->key.base_page << 12, binding->key.mip_page << 12,
+      static_cast<void*>(source.Get()), uint32_t(desc.Format),
+      uint32_t(GetDXGIUnormFormat(texture->key())), uint32_t(desc.Dimension),
+      uint32_t(binding->key.dimension), desc.Width, desc.Height, desc.DepthOrArraySize,
+      desc.MipLevels, desc.SampleDesc.Count, binding->host_swizzle,
+      uint32_t(binding->swizzled_signs), descriptor_index, bindless_resources_used_);
+
+  const bool is_cube = binding->key.dimension == xenos::DataDimension::kCube;
+  if ((!is_cube && binding->key.dimension != xenos::DataDimension::k2DOrStacked) ||
+      desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !desc.Width || !desc.Height ||
+      desc.Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+      desc.Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || !desc.DepthOrArraySize ||
+      desc.DepthOrArraySize > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION || !desc.MipLevels ||
+      desc.MipLevels > D3D12_REQ_MIP_LEVELS || desc.SampleDesc.Count != 1 ||
+      desc.SampleDesc.Quality != 0 ||
+      (is_cube && (desc.Width != desc.Height || desc.DepthOrArraySize % 6 != 0)) ||
+      !(std::max(desc.Width, uint64_t(desc.Height)) >> (desc.MipLevels - 1))) {
+    REXGPU_WARN("ufc3 texture readback: fc={} unsupported/inconsistent 2D/cube description",
+                fetch_constant);
+    return false;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  D3D12_FEATURE_DATA_FORMAT_INFO format_info = {desc.Format};
+  if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &format_info,
+                                          sizeof(format_info))) ||
+      format_info.PlaneCount != 1) {
+    REXGPU_WARN("ufc3 texture readback: fc={} unsupported format {} (requires one plane)",
+                fetch_constant, uint32_t(desc.Format));
+    return false;
+  }
+  // ponytail: bounded temporary capture; raise these limits for larger diagnostics.
+  constexpr uint32_t kMaxSubresources = 256;
+  constexpr uint64_t kMaxReadbackBytes = UINT64_C(256) << 20;
+  const uint32_t subresource_count = uint32_t(desc.MipLevels) * uint32_t(desc.DepthOrArraySize);
+  if (subresource_count > kMaxSubresources) {
+    REXGPU_WARN("ufc3 texture readback: fc={} subresources={} exceeds diagnostic limit {}",
+                fetch_constant, subresource_count, kMaxSubresources);
+    return false;
+  }
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> copy_layouts(subresource_count);
+  std::vector<UINT> row_counts(subresource_count);
+  std::vector<UINT64> row_bytes(subresource_count);
+  UINT64 copy_bytes = 0;
+  device->GetCopyableFootprints(&desc, 0, subresource_count, 0, copy_layouts.data(),
+                                 row_counts.data(), row_bytes.data(), &copy_bytes);
+  if (!copy_bytes || copy_bytes > kMaxReadbackBytes) {
+    REXGPU_WARN("ufc3 texture readback: fc={} bytes={} exceeds diagnostic limit {} or is invalid",
+                fetch_constant, copy_bytes, kMaxReadbackBytes);
+    return false;
+  }
+  uint64_t previous_end = 0;
+  for (uint32_t i = 0; i < subresource_count; ++i) {
+    const auto& layout = copy_layouts[i];
+    const auto& footprint = layout.Footprint;
+    if (!footprint.Width || !footprint.Height || footprint.Depth != 1 || !footprint.RowPitch ||
+        !row_counts[i] || row_counts[i] > desc.Height || !row_bytes[i] ||
+        row_bytes[i] > footprint.RowPitch || layout.Offset < previous_end ||
+        layout.Offset > copy_bytes ||
+        layout.Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0 ||
+        footprint.RowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0) {
+      REXGPU_WARN("ufc3 texture readback: fc={} invalid footprint for subresource {}",
+                  fetch_constant, i);
+      return false;
+    }
+    // Row counts are bounded above and pitches are UINT, so this cannot overflow.
+    const uint64_t used_bytes =
+        uint64_t(footprint.RowPitch) * (row_counts[i] - 1) + row_bytes[i];
+    if (used_bytes > copy_bytes - layout.Offset) {
+      REXGPU_WARN("ufc3 texture readback: fc={} subresource {} exceeds readback buffer",
+                  fetch_constant, i);
+      return false;
+    }
+    previous_end = layout.Offset + used_bytes;
+  }
+
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, copy_bytes, D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> destination;
+  const HRESULT result = device->CreateCommittedResource(
+      &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&destination));
+  if (FAILED(result)) {
+    REXGPU_WARN("ufc3 texture readback: fc={} allocation failed HRESULT={:08X} bytes={}",
+                fetch_constant, uint32_t(result), copy_bytes);
+    return false;
+  }
+
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  // Keep the cache-owned source ComPtr alive until this submission's fence completes.
+  texture->MarkAsUsed();
+  const D3D12_RESOURCE_STATES previous_state =
+      texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(source.Get(), previous_state,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = source.Get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION destination_location = {};
+  destination_location.pResource = destination.Get();
+  destination_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  for (uint32_t i = 0; i < subresource_count; ++i) {
+    source_location.SubresourceIndex = i;
+    destination_location.PlacedFootprint = copy_layouts[i];
+    command_list.D3DCopyTextureRegion(&destination_location, 0, 0, 0, &source_location, nullptr);
+    REXGPU_WARN(
+        "ufc3 texture readback layout: fc={} subresource={} mip={} array_slice={} "
+        "offset={} row_pitch={} rows={} row_bytes={} width={} height={} depth={} format={}",
+        fetch_constant, i, i % desc.MipLevels, i / desc.MipLevels, copy_layouts[i].Offset,
+        copy_layouts[i].Footprint.RowPitch, row_counts[i], row_bytes[i],
+        copy_layouts[i].Footprint.Width, copy_layouts[i].Footprint.Height,
+        copy_layouts[i].Footprint.Depth, uint32_t(copy_layouts[i].Footprint.Format));
+  }
+  command_processor_.PushTransitionBarrier(source.Get(), texture->SetResourceState(previous_state),
+                                           previous_state);
+  command_processor_.SubmitBarriers();
+  readback = std::move(destination);
+  description = desc;
+  layouts = std::move(copy_layouts);
+  total_bytes = copy_bytes;
+  return true;
 }
 
 D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(

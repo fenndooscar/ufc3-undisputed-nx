@@ -41,7 +41,7 @@ struct EstadisticasVentana {
 EstadisticasVentana LeerEstadisticasVentana();
 
 /*
- * Exact-range read cache. See nfsmw_io_rangos_mb in the .cpp.
+ * Exact-range read cache. See ufc3_undisputed_nx_io_rangos_mb in the .cpp.
  *
  * Everything is cumulative since startup, not per interval: there are few events and the total is
  * what matters.
@@ -127,7 +127,7 @@ class HostPathFile : public File {
   bool RellenarVentana(size_t byte_offset, size_t pedido, std::span<uint8_t> buffer,
                        size_t* out_bytes_read, X_STATUS* out_status);
 
-  // Direct read split into chunks. See the comment on nfsmw_io_trozo_mb in the .cpp.
+  // Direct read split into chunks. See the comment on ufc3_undisputed_nx_io_trozo_mb in the .cpp.
   X_STATUS LeerDirecta(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read);
 
   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
@@ -143,7 +143,7 @@ class HostPathFile : public File {
   bool ventana_activa_ = false;
   bool ventana_contada_ = false;
   // File id inside the RAM cache (0 = this file is not cached). See
-  // nfsmw_io_cache_mb.
+  // ufc3_undisputed_nx_io_cache_mb.
   uint32_t cache_id_ = 0;
 };
 

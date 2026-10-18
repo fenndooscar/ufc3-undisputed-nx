@@ -51,9 +51,9 @@
  *
  * A monotonic clock read per call is a few nanoseconds next to a trip to the SD. It is on.
  */
-REXCVAR_DEFINE_INT32(nfsmw_io_aviso_ms, 8, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_aviso_ms, 8, "Filesystem",
                      "Avisa en el log de cada apertura o lectura que pase de estos ms (0 = nunca).");
-REXCVAR_DEFINE_INT32(nfsmw_io_resumen_s, 15, "Filesystem",
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_io_resumen_s, 15, "Filesystem",
                      "Cada cuantos segundos se escribe el resumen [io] (0 = nunca).");
 
 namespace rex::kernel::xboxkrnl {
@@ -189,7 +189,7 @@ inline void MaxAtomico(std::atomic<uint64_t>& destino, uint64_t valor) {
 
 // A single thread writes the summary: whichever wins the exchange of the next deadline.
 void QuizaResumenIo(uint64_t ahora_us) {
-  const int32_t periodo_s = REXCVAR_GET(nfsmw_io_resumen_s);
+  const int32_t periodo_s = REXCVAR_GET(ufc3_undisputed_nx_io_resumen_s);
   if (periodo_s <= 0) {
     return;
   }
@@ -302,7 +302,7 @@ void QuizaResumenIo(uint64_t ahora_us) {
       desalojos);
 
   /*
-   * The cache of large reads by exact range (nfsmw_io_rangos_mb).
+   * The cache of large reads by exact range (ufc3_undisputed_nx_io_rangos_mb).
    *
    * It is accumulated since startup, not per interval: there are few events and what matters is
    * the session total. And it is always printed, whether it is on or not and whether there was
@@ -340,7 +340,7 @@ inline void AnotarApertura(uint64_t us, bool ok, const std::string_view ruta) {
   g_io.us_aperturas.fetch_add(us, std::memory_order_relaxed);
   MaxAtomico(g_io.us_apertura_peor, us);
 
-  const int32_t aviso_ms = REXCVAR_GET(nfsmw_io_aviso_ms);
+  const int32_t aviso_ms = REXCVAR_GET(ufc3_undisputed_nx_io_aviso_ms);
   if (aviso_ms > 0 && us >= static_cast<uint64_t>(aviso_ms) * 1000ull &&
       g_io_avisos.fetch_add(1, std::memory_order_relaxed) < 300) {
     REXKRNL_WARN("[io] LENTO: abrir '{}' tardo {:.1f} ms ({})", ruta, us / 1000.0,
@@ -357,7 +357,7 @@ inline void AnotarLectura(uint64_t us, uint32_t bytes, const std::string_view ru
 
   const bool releida = AnotarRango(ruta, desplazamiento, bytes);
 
-  const int32_t aviso_ms = REXCVAR_GET(nfsmw_io_aviso_ms);
+  const int32_t aviso_ms = REXCVAR_GET(ufc3_undisputed_nx_io_aviso_ms);
   if (aviso_ms > 0 && us >= static_cast<uint64_t>(aviso_ms) * 1000ull &&
       g_io_avisos.fetch_add(1, std::memory_order_relaxed) < 300) {
     // The offset is included. Without it a sequential sweep cannot be told apart from a reread.
@@ -368,37 +368,37 @@ inline void AnotarLectura(uint64_t us, uint32_t bytes, const std::string_view ru
 
 }  // namespace
 
-// NFSMW: last .wmv movie opened by the game. The app reopens it through the VFS and decodes it
+// UFC3_UNDISPUTED_NX: last .wmv movie opened by the game. The app reopens it through the VFS and decodes it
 // natively with FFmpeg, because the recompiled XDK WMV decoder does not reach real time on the
 // Switch.
 namespace {
-std::mutex g_nfsmw_wmv_mutex;
-std::string g_nfsmw_ultimo_wmv;
-std::vector<std::pair<const rex::filesystem::Entry*, std::string>> g_nfsmw_wmv_abiertos;
-std::string g_nfsmw_ultimo_wmv_leido;
+std::mutex g_ufc3_undisputed_nx_wmv_mutex;
+std::string g_ufc3_undisputed_nx_ultimo_wmv;
+std::vector<std::pair<const rex::filesystem::Entry*, std::string>> g_ufc3_undisputed_nx_wmv_abiertos;
+std::string g_ufc3_undisputed_nx_ultimo_wmv_leido;
 
-void NfsmwAnotarApertura(const rex::filesystem::Entry* entrada, const std::string& ruta) {
-  std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
-  g_nfsmw_ultimo_wmv = ruta;
-  for (auto& [e, r] : g_nfsmw_wmv_abiertos) {
+void Ufc3UndisputedNxAnotarApertura(const rex::filesystem::Entry* entrada, const std::string& ruta) {
+  std::lock_guard<std::mutex> lock(g_ufc3_undisputed_nx_wmv_mutex);
+  g_ufc3_undisputed_nx_ultimo_wmv = ruta;
+  for (auto& [e, r] : g_ufc3_undisputed_nx_wmv_abiertos) {
     if (e == entrada) {
       r = ruta;
       return;
     }
   }
-  if (g_nfsmw_wmv_abiertos.size() >= 64) {
-    g_nfsmw_wmv_abiertos.erase(g_nfsmw_wmv_abiertos.begin());
+  if (g_ufc3_undisputed_nx_wmv_abiertos.size() >= 64) {
+    g_ufc3_undisputed_nx_wmv_abiertos.erase(g_ufc3_undisputed_nx_wmv_abiertos.begin());
   }
-  g_nfsmw_wmv_abiertos.emplace_back(entrada, ruta);
+  g_ufc3_undisputed_nx_wmv_abiertos.emplace_back(entrada, ruta);
   REXLOG_INFO("[video] el juego abre '{}'", ruta);
 }
 
-void NfsmwAnotarLectura(const rex::filesystem::Entry* entrada) {
-  std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
-  for (const auto& [e, r] : g_nfsmw_wmv_abiertos) {
+void Ufc3UndisputedNxAnotarLectura(const rex::filesystem::Entry* entrada) {
+  std::lock_guard<std::mutex> lock(g_ufc3_undisputed_nx_wmv_mutex);
+  for (const auto& [e, r] : g_ufc3_undisputed_nx_wmv_abiertos) {
     if (e == entrada) {
-      if (r != g_nfsmw_ultimo_wmv_leido) {
-        g_nfsmw_ultimo_wmv_leido = r;
+      if (r != g_ufc3_undisputed_nx_ultimo_wmv_leido) {
+        g_ufc3_undisputed_nx_ultimo_wmv_leido = r;
         REXLOG_INFO("[video] el juego lee '{}'", r);
       }
       return;
@@ -407,15 +407,15 @@ void NfsmwAnotarLectura(const rex::filesystem::Entry* entrada) {
 }
 }  // namespace
 
-std::string NfsmwUltimoWmvAbierto() {
-  std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
-  return g_nfsmw_ultimo_wmv;
+std::string Ufc3UndisputedNxUltimoWmvAbierto() {
+  std::lock_guard<std::mutex> lock(g_ufc3_undisputed_nx_wmv_mutex);
+  return g_ufc3_undisputed_nx_ultimo_wmv;
 }
 
-// NFSMW: last .wmv movie read by the game: the one being played.
-std::string NfsmwUltimoWmvLeido() {
-  std::lock_guard<std::mutex> lock(g_nfsmw_wmv_mutex);
-  return g_nfsmw_ultimo_wmv_leido;
+// UFC3_UNDISPUTED_NX: last .wmv movie read by the game: the one being played.
+std::string Ufc3UndisputedNxUltimoWmvLeido() {
+  std::lock_guard<std::mutex> lock(g_ufc3_undisputed_nx_wmv_mutex);
+  return g_ufc3_undisputed_nx_ultimo_wmv_leido;
 }
 
 struct CreateOptions {
@@ -551,14 +551,14 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     // Handle ref is incremented, so return that.
     handle = file->handle();
 
-    // NFSMW: records the .wmv movies (see NfsmwUltimoWmvAbierto).
+    // UFC3_UNDISPUTED_NX: records the .wmv movies (see Ufc3UndisputedNxUltimoWmvAbierto).
     if (target_path.size() > 4) {
       std::string extension(target_path.substr(target_path.size() - 4));
       for (char& c : extension) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
       }
       if (extension == ".wmv") {
-        NfsmwAnotarApertura(vfs_file->entry(), std::string(target_path));
+        Ufc3UndisputedNxAnotarApertura(vfs_file->entry(), std::string(target_path));
       }
     }
   }
@@ -599,9 +599,9 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   X_STATUS result = X_STATUS_SUCCESS;
   bool apc_queued = false;
 
-  // NFSMW: last .wmv movie read (see NfsmwUltimoWmvLeido).
+  // UFC3_UNDISPUTED_NX: last .wmv movie read (see Ufc3UndisputedNxUltimoWmvLeido).
   if (auto leido = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle)) {
-    NfsmwAnotarLectura(leido->entry());
+    Ufc3UndisputedNxAnotarLectura(leido->entry());
   }
 
   bool signal_event = false;

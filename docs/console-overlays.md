@@ -262,7 +262,7 @@ applies those rules. That covers the game's output resolution, the window size a
 ### The resolution is chosen at startup
 
 The game chooses its output resolution once, about one second after it starts: 1280x720 in handheld mode and
-1920x1080 docked (with `nfsmw_resolucion_interna = "automatico"`). Changing the mode while playing changes the window
+1920x1080 docked (with `ufc3-undisputed-nx_resolucion_interna = "automatico"`). Changing the mode while playing changes the window
 size, but the game keeps the resolution it chose, scaled to the screen, until you restart it. The same happens when
 you dock or undock the console.
 
@@ -282,7 +282,7 @@ a command to follow ReverseNX-RT, but in Horizon OC's forks (`sys-clk-plus`, `sy
 `IpcService::SetReverseNXRTMode(mode) { return 0; }`, with the call to `rnxSync->ToggleSync(...)` commented out.
 `hanai3Bi/Switch-OC-Suite` and `rashevskyv/sys-clk-OC` do follow it by themselves.
 
-When the setting `nfsmw_switch_relojes_reverse` is on (it is **off** by default), the port asks the clock sysmodule
+When the setting `ufc3-undisputed-nx_switch_relojes_reverse` is on (it is **off** by default), the port asks the clock sysmodule
 itself. It does this whenever the mode that rules is different from the real one, in both directions:
 
 - **Fake Docked** with the console in your hands: the port reads the clocks you set in the docked column of your
@@ -318,14 +318,14 @@ changed.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `nfsmw_switch_saltynx` | on | Publishes the FPS and the resolution for the overlays, and follows the ReverseNX-RT mode. Without SaltyNX it does nothing. |
-| `nfsmw_switch_relojes_reverse` | off | Lets the clocks follow ReverseNX-RT when its mode does not match the real one. |
+| `ufc3-undisputed-nx_switch_saltynx` | on | Publishes the FPS and the resolution for the overlays, and follows the ReverseNX-RT mode. Without SaltyNX it does nothing. |
+| `ufc3-undisputed-nx_switch_relojes_reverse` | off | Lets the clocks follow ReverseNX-RT when its mode does not match the real one. |
 
-Both are in the **Graficos** category of the Debug Menu and in `nfsmw.toml`.
+Both are in the **Graficos** category of the Debug Menu and in `ufc3-undisputed-nx.toml`.
 
 ## Checking that it works
 
-Everything is written to the logs in the `logs/rex` folder next to the NRO (`sdmc:/switch/nfsmw/logs/rex/`):
+Everything is written to the logs in the `logs/rex` folder next to the NRO (`sdmc:/switch/ufc3-undisputed-nx/logs/rex/`):
 
 - `rex_stderr.log`, lines starting with `[saltynx]`: which port connected, whether the blocks were created or reused,
   the seconds it took to publish (`PUBLICADO a los ... s`), and, if it fails, the error code and the sessions in use

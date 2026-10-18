@@ -530,10 +530,15 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
   }
 }
 
-void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_surface_pitch) {
+void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_surface_pitch,
+                bool signed_window_scissor_origin) {
   auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
   int32_t tl_x = int32_t(pa_sc_window_scissor_tl.tl_x);
   int32_t tl_y = int32_t(pa_sc_window_scissor_tl.tl_y);
+  if (signed_window_scissor_origin) {
+    tl_x = (tl_x ^ 0x2000) - 0x2000;
+    tl_y = (tl_y ^ 0x2000) - 0x2000;
+  }
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   int32_t br_x = int32_t(pa_sc_window_scissor_br.br_x);
   int32_t br_y = int32_t(pa_sc_window_scissor_br.br_y);
@@ -665,12 +670,16 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
         break;
     }
     uint32_t stream_size_bytes = stream.index_count * (format_info.bits_per_pixel >> 3);
+    // Mask to physical like the shader does - the guest may use a mirror window,
+    // and everything downstream of this range (heap residency, GPU write
+    // tracking) works in physical addresses.
+    uint32_t stream_base_address_dwords = xenos::CpuToGpu(uint32_t(stream.base_address) << 2) >> 2;
     // Try to reduce the number of shared memory operations when writing
     // different elements into the same buffer through different exports
     // (happens in 4D5307E6).
     bool range_reused = false;
     for (MemExportRange& range : ranges_out) {
-      if (range.base_address_dwords == stream.base_address) {
+      if (range.base_address_dwords == stream_base_address_dwords) {
         range.size_bytes = std::max(range.size_bytes, stream_size_bytes);
         range_reused = true;
         break;
@@ -678,8 +687,27 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
     }
     // Add a new range if haven't expanded an existing one.
     if (!range_reused) {
-      ranges_out.emplace_back(uint32_t(stream.base_address), stream_size_bytes);
+      ranges_out.emplace_back(stream_base_address_dwords, stream_size_bytes);
     }
+  }
+}
+
+void ClampMemExportRangeToAllocation(MemExportRange& range, memory::Memory* memory) {
+  if (memory == nullptr) {
+    return;
+  }
+  uint32_t base_bytes = range.base_address_dwords << 2;
+  memory::HeapAllocationInfo allocation_info = {};
+  if (!memory->GetPhysicalHeap()->QueryRegionInfo(base_bytes, &allocation_info) ||
+      !(allocation_info.state & memory::kMemoryAllocationCommit) ||
+      !allocation_info.allocation_size || base_bytes < allocation_info.allocation_base) {
+    // Nothing known to clamp to - leaving the range as the title described it.
+    return;
+  }
+  uint32_t available_bytes =
+      allocation_info.allocation_base + allocation_info.allocation_size - base_bytes;
+  if (range.size_bytes > available_bytes) {
+    range.size_bytes = available_bytes;
   }
 }
 
@@ -793,8 +821,8 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     assert_always();
     return false;
   }
-  const float* vertices_guest =
-      reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+  const float* vertices_guest = reinterpret_cast<const float*>(memory.TranslateVirtual(
+      0xA0000000u | ((fetch.address * sizeof(uint32_t)) & 0x1FFFFFFFu)));
   // Most vertices have a negative half-pixel offset applied, which we reverse.
   float half_pixel_offset =
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
@@ -831,7 +859,11 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // False because clamping to the surface pitch will be done later (it will be
   // aligned to the resolve alignment here, for resolving from render targets
   // with a pitch that is not a multiple of 8).
-  GetScissor(regs, scissor, false);
+  // A part crossing a texture tile starts at a negative coordinate in the next
+  // tile. The resolve packet packs that origin modulo 14 bits (for example,
+  // -320 becomes 0x3EC0). Treating it as positive collapses the copy to empty,
+  // dropping the tail even though it was drawn correctly in this tile.
+  GetScissor(regs, scissor, false, true);
   int32_t scissor_right = int32_t(scissor.offset[0] + scissor.extent[0]);
   int32_t scissor_bottom = int32_t(scissor.offset[1] + scissor.extent[1]);
   x0 = std::clamp(x0, int32_t(scissor.offset[0]), scissor_right);

@@ -644,7 +644,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       if (cache_transaction.GetFoundResult()) {
         cacheable = *cache_transaction.GetFoundResult();
       } else {
-        const void* guest_indices_ptr = memory_.TranslatePhysical(guest_index_base);
+        const void* guest_indices_ptr = memory_.TranslateVirtual(0xA0000000u | guest_index_base);
         cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
         cacheable.host_primitive_reset_enabled = false;
         std::function<uint32_t(uint32_t)> host_index_count_getter;

@@ -1,0 +1,28 @@
+# UFC3_UNDISPUTED_NX Recomp - executable configuration.
+# Read at startup next to the executable; command-line flags take precedence.
+
+# Use host render targets for the PC D3D12 backend.
+render_target_path_d3d12 = "rtv"
+
+# Accept the texture fetch constants observed in this game's career/training path.
+gpu_allow_invalid_fetch_constants = true
+
+# D3D12 at 1x delivers GPU-written data when the guest CPU reads it.
+# CAF generation uses the corrected integer fetch and clipped resolve paths;
+# it does not require eagerly reading back every resolve or memory export.
+# Back up and regenerate previously damaged CAF atlases in the editor.
+# See docs/building.md, "CAF texture recovery".
+readback_resolve = "none"
+
+readback_memexport = false
+readback_memexport_fast = false
+
+# Unchanged: no asynchronous draw skips were logged in the recovery session.
+async_shader_compilation = true
+
+# Let the Xenos plugin choose its default PC backend (D3D12).
+gpu_backend = "any"
+
+# Shader dumps are opt-in diagnostics.
+dump_shaders = ""
+d3d12_dxbc_disasm = false

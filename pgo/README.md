@@ -1,40 +1,31 @@
 # Profiles for profile guided optimization
 
-This folder has the profiles the released NROs were built with, one folder per [edition](../docs/glossary.md#edition)
-of the game. [PGO](../docs/glossary.md#pgo) (profile guided optimization) builds the program with a record of which
-code runs most, so the compiler can optimise for it. You need these files to build an NRO like the released ones
-(`-DNFSMW_PGO=usar`, see [docs/building.md](../docs/building.md)).
+**This folder is empty on purpose.** It holds nothing for UFC 3 Undisputed yet.
 
-Each folder has the GCC profile, as `.gcda` files (the files where GCC keeps its counters):
+The fork this port comes from (nfsmw-nx) shipped 1,328 GCC profile files (`.gcda`) here, one folder per
+[edition](../docs/glossary.md#edition) of *Need for Speed: Most Wanted*. They were deleted, and they must not be
+restored from git history. The reason is in [AGENTS.md](../AGENTS.md) trap 3: a GCC profile matches a function by a
+fingerprint of its name, and every recompiled function is named after its
+[guest](../docs/glossary.md#guest) address. A profile recorded for another game therefore does not fail — it quietly
+optimises for addresses this game does not have. `tools/build.ps1` defaults `-Pgo` to empty for the same reason.
 
-| Folder | Edition |
-|---|---|
-| `pal_es` | PAL Spanish (the default tree `app/`) |
-| `pal_en` | PAL English |
-| `pal_fr` | PAL French |
-| `pal_de` | PAL German |
-| `pal_it` | PAL Italian |
-| `pal_pl` | PAL Polish (fan translation) |
-| `usa` | NTSC-U |
-| `jpn` | NTSC-J |
+## Recording a profile for this game
 
-## Where the profiles come from
+Only worth doing once the game runs and there is something to measure:
 
-`pal_es` was recorded on the console while playing, with an instrumented build (`-DNFSMW_PGO=generar`): a special
-build that counts how often each piece of code runs. It is not a complete profile. It comes from a small test, done
-only to check that PGO improves the port's performance, not from playing through the whole game.
+1. Build with `-Pgo generar` ([app/CMakeLists.txt](../app/CMakeLists.txt)), an instrumented build that counts how
+   often each piece of code runs and dumps the counters to `sdmc:/switch/ufc3-undisputed-nx/pgo/` every three minutes
+   ([app/src/ufc3-undisputed-nx_pgo.cpp](../app/src/ufc3-undisputed-nx_pgo.cpp)).
+2. Copy those `.gcda` files to a folder here, one per edition.
+3. Rebuild with `-Pgo usar`.
 
-The others are that same profile, translated to the addresses of each edition by
-`tools/editions/pgo/traducir_perfil.py` ("translate profile"). This is needed because each recompiled function is
-named after its [guest](../docs/glossary.md#guest) address (for example `__imp__sub_823B5A40`), and in other editions
-the same function is often at another address. GCC finds each function in the profile by a hash of its name, so that
-hash changes from one edition to another.
+The folder name is arbitrary, but `app/CMakeLists.txt` defaults to `pgo/pal_es`, so keep that one unless you change the
+default too.
 
 ## What the files contain
 
-The files contain counters and hashes of function names, nothing from the game. Each file name is the path of an
-object file relative to the build folder, with `#` instead of `/`. So GCC finds them as long as the build folder has
-the same layout.
+Counters and hashes of function names, nothing from the game. Each file name is the path of an object file relative to
+the build folder, with `#` instead of `/`, so GCC finds them as long as the build folder has the same layout.
 
-How to use a profile and how to record a new one is in [docs/building.md](../docs/building.md). The traps of PGO with
-GCC on the Switch are in [docs/toolchain.md](../docs/toolchain.md).
+How to use a profile, and the traps of PGO with GCC on the Switch, are in [docs/building.md](../docs/building.md) and
+[docs/toolchain.md](../docs/toolchain.md).

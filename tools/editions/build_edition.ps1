@@ -29,7 +29,7 @@ if (-not (Test-Path "$tree\out\sw8\CMakeCache.txt")) {
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
     $now = Get-Date
     Get-ChildItem "$tree\src", "$tree\generated\default" -Recurse -File | ForEach-Object { $_.LastWriteTime = $now }
-    foreach ($f in 'CMakeLists.txt', 'orden_funciones.ld', 'nfsmw.toml') { (Get-Item "$tree\$f").LastWriteTime = $now }
+    foreach ($f in 'CMakeLists.txt', 'orden_funciones.ld', 'ufc3-undisputed-nx.toml') { (Get-Item "$tree\$f").LastWriteTime = $now }
 }
 
 # Memory watchdog: the link time optimization of the whole program is the peak. Below 2.5 GB free the build is
@@ -76,4 +76,4 @@ finally {
     Stop-Job $watchdog; Remove-Job $watchdog
     "END $(Get-Date) ($([int]((Get-Date) - $start).TotalMinutes) min)" | Out-File -Append -Encoding utf8 $log
 }
-Write-Output "Built $tree\out\sw8\nfsmw.nro"
+Write-Output "Built $tree\out\sw8\ufc3-undisputed-nx.nro"

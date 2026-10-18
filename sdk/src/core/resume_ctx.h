@@ -13,7 +13,7 @@
  * It reloaded the registers from the dump and did `br x16`, assuming x16 was
  * dead and leaving x18 untouched. Both assumptions are false at any instruction
  * that is not a call: GCC uses x16, x17 and x18 as normal registers inside a
- * function. In NFSMW, sub_824D2A58 read a constant from the XEX image (a
+ * function. In UFC3_UNDISPUTED_NX, sub_824D2A58 read a constant from the XEX image (a
  * read-only page, unmapped), the handler emulated it, and on return x16 held the
  * resume address instead of 0x145c. The next write went to 0x80E814E4 and the
  * game closed. A manual jump always needs a register for the target, so there is

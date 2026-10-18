@@ -919,13 +919,12 @@ bool PipelineCache::ConfigurePipeline(
               register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
-  // Ucode analysis is always needed on the main thread (for modification and
-  // hash computation). Translation can be deferred to background threads when
-  // async compilation is enabled.
+  // Shader metadata and the final root signature are needed before recording
+  // draws. Only PSO creation may be deferred to background threads.
   if (!vertex_shader->shader().is_ucode_analyzed()) {
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
   }
-  if (!vertex_shader->is_translated() && !use_async) {
+  if (!vertex_shader->is_translated()) {
     std::lock_guard<std::mutex> lock(translation_request_lock_);
     if (!vertex_shader->is_translated()) {
       if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader, dxbc_converter_, dxc_utils_,
@@ -946,12 +945,12 @@ bool PipelineCache::ConfigurePipeline(
       }
     }
   }
-  if (!use_async && !vertex_shader->is_valid()) {
+  if (!vertex_shader->is_valid()) {
     // Translation attempted previously, but not valid.
     return false;
   }
   if (pixel_shader != nullptr) {
-    if (!pixel_shader->is_translated() && !use_async) {
+    if (!pixel_shader->is_translated()) {
       std::lock_guard<std::mutex> lock(translation_request_lock_);
       if (!pixel_shader->is_translated()) {
         pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
@@ -982,7 +981,7 @@ bool PipelineCache::ConfigurePipeline(
   if (!GetCurrentStateDescription(
           vertex_shader, pixel_shader, primitive_processing_result, normalized_depth_control,
           normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, runtime_description, use_async)) {
+          bound_depth_and_color_render_target_formats, runtime_description, false)) {
     return false;
   }
   PipelineDescription& description = runtime_description.description;

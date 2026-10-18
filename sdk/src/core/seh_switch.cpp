@@ -23,7 +23,7 @@
  *    asynchronous EH flags on Windows, so there is no guarantee that the catch
  *    would ever run: the likely outcome would be std::terminate.
  *
- * 3. NFSMW does not use it. generate_exception_handlers is false by default, and
+ * 3. UFC3_UNDISPUTED_NX does not use it. generate_exception_handlers is false by default, and
  *    it is commented out in app/overrides.toml. With that off, the SEH macros are
  *    not emitted.
  *

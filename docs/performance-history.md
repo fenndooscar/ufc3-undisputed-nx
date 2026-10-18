@@ -159,7 +159,7 @@ Heritage Heights, with about 3,000 draws per frame: it runs at 21-22 FPS for its
 
 - **The overclocked numbers of the first days were the most expensive mistake.** They hid for days that the GPU was
   the limit. Measure at stock clocks from the start.
-- **A configuration file that overrides the code's defaults** (such as `nfsmw.toml`) can keep a change switched off
+- **A configuration file that overrides the code's defaults** (such as `ufc3-undisputed-nx.toml`) can keep a change switched off
   for several builds without anyone noticing. Check in the log what is really running.
 - **One millisecond of GPU is not one millisecond of frame.** When the CPU and the GPU work at the same time, only
   half of a GPU saving shows up.

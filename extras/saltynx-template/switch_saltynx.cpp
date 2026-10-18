@@ -1,5 +1,5 @@
 /*
- * SaltyNX support for a homebrew program (.nro). Template taken from NFSMW-NX (sdk/src/ui/switch_saltynx.cpp).
+ * SaltyNX support for a homebrew program (.nro). Template taken from UFC3_UNDISPUTED_NX-NX (sdk/src/ui/switch_saltynx.cpp).
  *
  * The FPS counter of the console overlays (Status Monitor Overlay and its forks, such as Horizon OC Monitor) is not
  * computed by them: they read it from a shared memory page published by SaltyNX. That page is filled in by NX-FPS, a

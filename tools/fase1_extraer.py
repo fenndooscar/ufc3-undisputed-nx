@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NFSMW Recomp - phase 1: extract the Xbox 360 ISO and dump the XEX info.
+UFC3_UNDISPUTED_NX Recomp - phase 1: extract the Xbox 360 ISO and dump the XEX info.
 
 No dependencies: only the Python 3.8+ standard library.
 
 Typical usage:
-    python tools/fase1_extraer.py "D:\\dumps\\NFSMW.iso" --listar
-    python tools/fase1_extraer.py "D:\\dumps\\NFSMW.iso" -o assets/game_root
+    python tools/fase1_extraer.py "D:\\dumps\\UFC3_UNDISPUTED_NX.iso" --listar
+    python tools/fase1_extraer.py "D:\\dumps\\UFC3_UNDISPUTED_NX.iso" -o assets/game_root
     python tools/fase1_extraer.py assets/game_root/default.xex --info
 
 What it does:
@@ -331,10 +331,12 @@ def info_xex(ruta):
                   % (clave, nombre, opcionales[clave]))
 
         print()
-        if title_id == 0x454107D9:
-            print("  >> Title ID coincide con Need for Speed: Most Wanted (2005). Correcto.")
+        # 5451087D is UFC 3 Undisputed's Title ID, read from the retail ISO's own default.xex
+        # (Title ID 5451087D, Media ID 3E0E52AB, version 0.0.0.4).
+        if title_id == 0x5451087D:
+            print("  >> Title ID coincide con UFC 3 Undisputed (2012). Correcto.")
         elif title_id is not None:
-            print("  >> OJO: el Title ID esperado para NFSMW 2005 es 454107D9.")
+            print("  >> OJO: el Title ID esperado para UFC 3 Undisputed es 5451087D.")
             print("     Este XEX es 0x%08X. Comprueba que dumpeaste el juego correcto." % title_id)
 
         print()

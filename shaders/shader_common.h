@@ -3,7 +3,7 @@
 
 #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
 #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
-// NFSMW: constants arrive through a dynamic UBO (a constant bank on Maxwell) instead of being read
+// UFC3_UNDISPUTED_NX: constants arrive through a dynamic UBO (a constant bank on Maxwell) instead of being read
 // through a 64-bit pointer. High bit so as not to clash with the UNLEASHED_RECOMP ones.
 #define SPEC_CONSTANT_CONSTANTES_UBO    (1 << 8)
 // The tfetch offset is scaled with 1/size taken from the shared constants instead of querying the
@@ -41,7 +41,7 @@
  */
 #define SPEC_CONSTANT_SIN_DESENFOQUE    (1 << 19)
 /*
- * The world shadow map as the minimum of two textures (nfsmw_nativo_sombra_minimo).
+ * The world shadow map as the minimum of two textures (ufc3_undisputed_nx_nativo_sombra_minimo).
  *
  * The game resolves the same 1600x1600 map twice: without cars (sampled by the car body) and with the
  * cars drawn on top (sampled by the world). With this option the renderer draws the cars onto a
@@ -57,7 +57,7 @@
  * shaders that use it (OpConstant) and nowhere else. The specialization constant never reaches this
  * value (bits 24-30).
  */
-#define NFSMW_MARCA_SOMBRA_MINIMO       0x5E3B1A84u
+#define UFC3_UNDISPUTED_NX_MARCA_SOMBRA_MINIMO       0x5E3B1A84u
 #define SPEC_CONSTANT_ALPHA_FUNC_SHIFT  16
 #define SPEC_CONSTANT_ALPHA_FUNC_MASK   (7 << 16)
 
@@ -83,34 +83,34 @@ struct PushConstants
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
 
-// NFSMW: the same blocks of the upload buffer, also as dynamic UBOs in set 4. With
+// UFC3_UNDISPUTED_NX: the same blocks of the upload buffer, also as dynamic UBOs in set 4. With
 // -fvk-use-dx-layout each float4 takes 16 contiguous bytes, so any 4-byte word of the shared block is
 // a component: v[B / 16][(B % 16) / 4], and asuint reads it without changing a bit.
-struct NfsmwBloqueVs { float4 v[256]; };
-struct NfsmwBloquePs { float4 v[224]; };
-struct NfsmwBloqueCompartidas { float4 v[23]; };
-[[vk::binding(0, 4)]] ConstantBuffer<NfsmwBloqueVs> g_UboVertex;
-[[vk::binding(1, 4)]] ConstantBuffer<NfsmwBloquePs> g_UboPixel;
-[[vk::binding(2, 4)]] ConstantBuffer<NfsmwBloqueCompartidas> g_UboCompartidas;
-#define NFSMW_UBO ((g_SpecConstants & SPEC_CONSTANT_CONSTANTES_UBO) != 0)
-#define NFSMW_COMPARTIDA_UINT(B)  asuint(g_UboCompartidas.v[(B) / 16][((B) % 16) / 4])
-#define NFSMW_COMPARTIDA_FLOAT(B) g_UboCompartidas.v[(B) / 16][((B) % 16) / 4]
+struct Ufc3UndisputedNxBloqueVs { float4 v[256]; };
+struct Ufc3UndisputedNxBloquePs { float4 v[224]; };
+struct Ufc3UndisputedNxBloqueCompartidas { float4 v[23]; };
+[[vk::binding(0, 4)]] ConstantBuffer<Ufc3UndisputedNxBloqueVs> g_UboVertex;
+[[vk::binding(1, 4)]] ConstantBuffer<Ufc3UndisputedNxBloquePs> g_UboPixel;
+[[vk::binding(2, 4)]] ConstantBuffer<Ufc3UndisputedNxBloqueCompartidas> g_UboCompartidas;
+#define UFC3_UNDISPUTED_NX_UBO ((g_SpecConstants & SPEC_CONSTANT_CONSTANTES_UBO) != 0)
+#define UFC3_UNDISPUTED_NX_COMPARTIDA_UINT(B)  asuint(g_UboCompartidas.v[(B) / 16][((B) % 16) / 4])
+#define UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(B) g_UboCompartidas.v[(B) / 16][((B) % 16) / 4]
 
-#define g_Booleans                 (NFSMW_UBO ? NFSMW_COMPARTIDA_UINT(256) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256))
-#define g_SwappedTexcoords         (NFSMW_UBO ? NFSMW_COMPARTIDA_UINT(260) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260))
-#define g_HalfPixelOffset          (NFSMW_UBO ? float2(NFSMW_COMPARTIDA_FLOAT(264), NFSMW_COMPARTIDA_FLOAT(268)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264))
-#define g_AlphaThreshold           (NFSMW_UBO ? NFSMW_COMPARTIDA_FLOAT(272) : vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272))
-// NFSMW: alpha test function (RB_COLORCONTROL.alpha_func): 0 never, 1 <, 2 ==, 3 <=,
+#define g_Booleans                 (UFC3_UNDISPUTED_NX_UBO ? UFC3_UNDISPUTED_NX_COMPARTIDA_UINT(256) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256))
+#define g_SwappedTexcoords         (UFC3_UNDISPUTED_NX_UBO ? UFC3_UNDISPUTED_NX_COMPARTIDA_UINT(260) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260))
+#define g_HalfPixelOffset          (UFC3_UNDISPUTED_NX_UBO ? float2(UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(264), UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(268)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264))
+#define g_AlphaThreshold           (UFC3_UNDISPUTED_NX_UBO ? UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(272) : vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272))
+// UFC3_UNDISPUTED_NX: alpha test function (RB_COLORCONTROL.alpha_func): 0 never, 1 <, 2 ==, 3 <=,
 // 4 >, 5 !=, 6 >=, 7 always.
-#define g_AlphaFunction            (NFSMW_UBO ? NFSMW_COMPARTIDA_UINT(276) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276))
-// NFSMW: position to host clip space, like ndc_scale/ndc_offset in the
+#define g_AlphaFunction            (UFC3_UNDISPUTED_NX_UBO ? UFC3_UNDISPUTED_NX_COMPARTIDA_UINT(276) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276))
+// UFC3_UNDISPUTED_NX: position to host clip space, like ndc_scale/ndc_offset in the
 // emulation (graphics/util/draw.cpp). (1, 1) and (0, 0) for normal draws;
 // with Xenos clipping disabled it converts from pixels to NDC.
-#define g_NdcScale                 (NFSMW_UBO ? float2(NFSMW_COMPARTIDA_FLOAT(280), NFSMW_COMPARTIDA_FLOAT(284)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 280))
-#define g_NdcOffset                (NFSMW_UBO ? float2(NFSMW_COMPARTIDA_FLOAT(288), NFSMW_COMPARTIDA_FLOAT(292)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 288))
-// NFSMW: where each component of the vertex input at that location comes from
+#define g_NdcScale                 (UFC3_UNDISPUTED_NX_UBO ? float2(UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(280), UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(284)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 280))
+#define g_NdcOffset                (UFC3_UNDISPUTED_NX_UBO ? float2(UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(288), UFC3_UNDISPUTED_NX_COMPARTIDA_FLOAT(292)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 288))
+// UFC3_UNDISPUTED_NX: where each component of the vertex input at that location comes from
 // (D3D patches the fetch swizzle according to the declaration). 0xFFF = as is.
-#define g_InputRemap(LOC)          (NFSMW_UBO ? NFSMW_COMPARTIDA_UINT(296 + (LOC) * 4) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 296 + (LOC) * 4))
+#define g_InputRemap(LOC)          (UFC3_UNDISPUTED_NX_UBO ? UFC3_UNDISPUTED_NX_COMPARTIDA_UINT(296 + (LOC) * 4) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 296 + (LOC) * 4))
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
@@ -217,7 +217,7 @@ float4 tfetch2DSombra(uint resourceDescriptorIndex, uint samplerDescriptorIndex,
     return tfetch2D(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset, invSize);
 }
 
-// The shadow map with the minimum of its pair (nfsmw_nativo_sombra_minimo). The library step changes
+// The shadow map with the minimum of its pair (ufc3_undisputed_nx_nativo_sombra_minimo). The library step changes
 // all shadow map calls to this function and passes it the 3D index of that same register, which is
 // where the app puts the pair: the world map (or the texture itself, which gives the same texel, while
 // the app is checking). Both are sampled the same way (same point sampler, same coordinates and
@@ -225,7 +225,7 @@ float4 tfetch2DSombra(uint resourceDescriptorIndex, uint samplerDescriptorIndex,
 // true and the driver removes it when specializing.
 float4 tfetch2DSombraMin(uint resourceDescriptorIndex, uint parejaDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float2 invSize)
 {
-    [branch] if (g_SpecConstants() == NFSMW_MARCA_SOMBRA_MINIMO)
+    [branch] if (g_SpecConstants() == UFC3_UNDISPUTED_NX_MARCA_SOMBRA_MINIMO)
         return float4(0.0, 0.0, 0.0, 0.0);
     float4 valor = tfetch2DSombra(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset, invSize);
     [branch] if (g_SpecConstants() & SPEC_CONSTANT_SOMBRA_MINIMO)
@@ -302,7 +302,7 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
     return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
 }
 
-// NFSMW: 3 bits per component: 0-3 = data component, 4 = 0, 5 = 1, 7 = unchanged.
+// UFC3_UNDISPUTED_NX: 3 bits per component: 0-3 = data component, 4 = 0, 5 = 1, 7 = unchanged.
 float4 remapInput(float4 value, uint code)
 {
     if (code == 0xFFF)
@@ -322,7 +322,7 @@ float4 remapInput(float4 value, uint code)
     return result;
 }
 
-// NFSMW: Xenos alpha test with its comparison function. Positive if the pixel passes.
+// UFC3_UNDISPUTED_NX: Xenos alpha test with its comparison function. Positive if the pixel passes.
 float alphaTestValue(float alpha)
 {
     bool pass = true;

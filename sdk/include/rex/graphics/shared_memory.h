@@ -78,6 +78,15 @@ class SharedMemory {
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+  bool RequestAllAllocatedRanges();
+  // CPU providers (including CP reads) deliver only the requested dirty runs.
+  bool SynchronizeForCpu(uint32_t start, uint32_t length);
+  bool HasCpuReadback() const { return memory_data_provider_handle_ != nullptr; }
+  void ShutdownCpuReadback();
+  uint64_t GetMemoryGeneration(uint32_t address) {
+    auto lock = global_critical_region_.Acquire();
+    return system_page_gpu_generation_[address >> page_size_log2_];
+  }
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -93,12 +102,12 @@ class SharedMemory {
   // be called, to make sure, if the GPU writes don't overwrite *everything* in
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
-  void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  void RangeWrittenByGpu(uint32_t start, uint32_t length, bool exact_destination = true);
 
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
-  void InitializeCommon();
+  void InitializeCommon(bool cpu_readback = false);
   void InitializeSparseHostGpuMemory(uint32_t granularity_log2);
   // Call last in implementation-specific shutdown, also callable from the
   // destructor.
@@ -139,6 +148,13 @@ class SharedMemory {
   // overall bounds of pages to be uploaded.
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+  virtual bool PrepareRangesForGpu(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+    return true;
+  }
+  // Returns a snapshot only, never writes guest RAM. Called without the global
+  // region; the provider validates page generations before publishing bytes.
+  virtual bool ReadbackForCpu(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+                              std::vector<uint8_t>& data) { return false; }
 
  private:
   memory::Memory& memory_;
@@ -175,6 +191,13 @@ class SharedMemory {
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
+  std::vector<uint64_t> system_page_flags_gpu_dirty_;
+  std::vector<uint64_t> system_page_gpu_generation_;
+  uint64_t next_gpu_generation_ = 0;
+  static bool MemoryDataProviderThunk(void* context,
+      std::unique_lock<std::recursive_mutex>& global_lock, uint32_t start, uint32_t length);
+  bool ProvideMemory(std::unique_lock<std::recursive_mutex>& global_lock,
+                     uint32_t start, uint32_t length);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

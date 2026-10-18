@@ -60,7 +60,7 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
    * A folder is not opened as a file.
    *
    * On the Xbox 360, opening a directory is legal: games do it to enumerate it or just to check that
-   * the drive is mounted. NFSMW opens the root of its save container ("rmcsave:\") right after
+   * the drive is mounted. UFC3_UNDISPUTED_NX opens the root of its save container ("rmcsave:\") right after
    * mounting it, and this code used to try to open a FILE* on that folder. That always fails,
    * NO_SUCH_FILE was returned, and the game read it as "this save cannot be used": hence the
    * "damaged profile" on load. Creating a profile did not hit it, because then the game writes a

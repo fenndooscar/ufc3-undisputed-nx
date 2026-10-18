@@ -144,9 +144,8 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   SCOPE_profile_cpu_f("cpu");
   PROFILE_INTERRUPT_DISPATCHED();
 
-  // Hold the global lock during interrupt dispatch.
-  auto global_lock = global_critical_region_.Acquire();
-
+  // The caller owns this ThreadState. Guest interrupt code may fault on GPU
+  // memory and wait for its provider, so no global memory lock may span it.
   auto* ctx = thread_state->context();
   assert_true(arg_count <= 5);
 
@@ -167,14 +166,12 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   uint32_t old_tls_ptr = memory::load_and_swap<uint32_t>(pcr_address);
   memory::store_and_swap<uint32_t>(pcr_address, 0);
 
-  if (!Execute(thread_state, address)) {
-    return 0xDEADBABE;
-  }
+  const bool executed = Execute(thread_state, address);
 
-  // Restore TLS ptr.
+  // Restore TLS ptr on both success and a missing callback target.
   memory::store_and_swap<uint32_t>(pcr_address, old_tls_ptr);
 
-  return ctx->r3.u64;
+  return executed ? ctx->r3.u64 : 0xDEADBABE;
 }
 
 // rexglue function table management

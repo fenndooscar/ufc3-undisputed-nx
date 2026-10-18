@@ -285,7 +285,10 @@ struct Scissor {
   // Extent can be zero.
   uint32_t extent[2];
 };
-void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_surface_pitch = true);
+// Tiled resolves may pack a negative rectangle origin into the 14-bit window TL.
+// Decode that origin before offsetting and clipping; ordinary draws keep their interpretation.
+void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_surface_pitch = true,
+                bool signed_window_scissor_origin = false);
 
 // Returns the color component write mask for the draw command taking into
 // account which color targets are written to by the pixel shader, as well as
@@ -329,6 +332,23 @@ struct MemExportRange {
 // constants from the registers, adding them to ranges_out.
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
                         std::vector<MemExportRange>& ranges_out);
+
+// Clamps a memexport range to the committed guest allocation containing its base
+// address.
+//
+// A stream constant gives the destination as a base address and an element
+// count, and that count is not always the number of elements the shader really
+// exports - it can be the size of the destination surface, or simply a stale
+// value. The range then runs past the end of the allocation the game made for
+// it, and everything derived from the range (heap residency requests, texture
+// invalidation, CPU readback) is applied to pages that were never allocated.
+// In UFC 3 Undisputed a character's skinning export asks for 8 MB where the game
+// committed 512 KB, and 256 KB where it committed 32 KB, and the draw consuming
+// those vertices collapses - the model disappears.
+//
+// A title cannot have exported past what it allocated, so clamping is safe, and
+// it leaves ranges that already fit untouched.
+void ClampMemExportRangeToAllocation(MemExportRange& range, memory::Memory* memory);
 
 // To avoid passing values that the shader won't understand (even though
 // Direct3D 9 shouldn't pass them anyway).

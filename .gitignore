@@ -16,7 +16,7 @@ assets/
 generated/
 app*/generated/
 app*/src/copias_literales/
-app*/src/nfsmw_nativo_resplandor_*_spirv.h
+app*/src/ufc3-undisputed-nx_nativo_resplandor_*_spirv.h
 app_*/
 
 # --- Build output -------------------------------------------------------------
@@ -32,8 +32,16 @@ build/
 *.err
 shaders/wasm/out/
 
+# --- Vendored third-party sources ---------------------------------------------
+# Arrive through tools/fetch_thirdparty.py (~19,000 files, some of them symlinks
+# and submodule markers). The seven files this port actually changed are already
+# tracked, and .gitignore does not untrack anything, so they stay.
+sdk/thirdparty/
+
 # --- Tools --------------------------------------------------------------------
 __pycache__/
 *.pyc
 .vs/
 .vscode/
+graphify-out/
+mesa/mesa-switch

@@ -284,7 +284,7 @@ class XmaContext {
   uint32_t id_ = 0;
   uint32_t guest_ptr_ = 0;
   std::mutex lock_;
-  // NFSMW: silence watchdog, measurement only (see AnotarProduccion in xma_context.cpp).
+  // UFC3_UNDISPUTED_NX: silence watchdog, measurement only (see AnotarProduccion in xma_context.cpp).
   void AnotarProduccion(bool produjo, uint8_t motivo, const XMA_CONTEXT_DATA& data);
   std::chrono::steady_clock::time_point silencio_desde_{};
   bool en_silencio_ = false;

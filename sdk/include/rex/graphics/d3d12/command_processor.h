@@ -46,6 +46,10 @@ namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor : public CommandProcessor {
  public:
+  bool ReadbackSharedMemoryForCpu(
+      const std::vector<std::pair<uint32_t, uint32_t>>& ranges, std::vector<uint8_t>& data);
+  bool PreparePacketMemoryReads(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+
   explicit D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                  system::KernelState* kernel_state);
   ~D3D12CommandProcessor();
@@ -211,6 +215,8 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  void PrepareForWait() override;
+  bool WriteGpuMemory(uint32_t address, uint32_t value) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -311,6 +317,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   // the submission to await to simply check status, or pass submission_current_
   // to wait for all queue operations to be completed.
   void CheckSubmissionFence(uint64_t await_submission);
+  struct PacketMemoryWrite {
+    uint64_t submission;
+    uint32_t address;
+    uint32_t value;
+  };
+  std::deque<PacketMemoryWrite> packet_memory_writes_;
+  bool publishing_packet_memory_writes_ = false;
+  uint64_t packet_wakeup_submission_ = 0;
+  void PublishPacketMemoryWrites(uint64_t completed_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -412,9 +427,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                  uint64_t samples);
-  void InvalidateAllVertexBufferResidency();
-  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
-  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
@@ -659,12 +671,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
-  struct VertexBufferState {
-    uint32_t address = UINT32_MAX;
-    uint32_t size = UINT32_MAX;
-  };
-  std::array<VertexBufferState, 96> vertex_buffer_states_{};
-  uint64_t vertex_buffers_in_sync_[2] = {};
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;

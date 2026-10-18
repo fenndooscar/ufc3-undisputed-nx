@@ -1,4 +1,4 @@
-/* nfsmw - console performance profile (apm). See switch_apm.cpp. */
+/* ufc3-undisputed-nx - console performance profile (apm). See switch_apm.cpp. */
 #pragma once
 
 #include "rex/platform.h"

@@ -1,6 +1,6 @@
 """Lists the functions with the most profiler samples, hottest first (the input for orden_funciones.ld).
 
-Usage: python tools/calientes.py <rex_perfil.log> <nfsmw.elf> <output.txt>
+Usage: python tools/calientes.py <rex_perfil.log> <ufc3-undisputed-nx.elf> <output.txt>
 
 rex_perfil.log is written by the sampling profiler of the app: every sample carries the addresses it saw (pc, lr
 and stack) as imagen+0x.... Each address is resolved with addr2line against the unstripped ELF of the same build and

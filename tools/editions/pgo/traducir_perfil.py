@@ -27,7 +27,7 @@ import gcda
 
 # app/ of this repository, spelled as CMake passes it to GCC (forward slashes). The profile of local functions
 # only matches when the sources are compiled from this same path (see docs/toolchain.md).
-RAIZ_APP = os.environ.get('NFSMW_APP_DIR') or os.path.abspath(
+RAIZ_APP = os.environ.get('UFC3_UNDISPUTED_NX_APP_DIR') or os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', '..', '..', 'app')).replace(os.sep, '/')
 DEF = re.compile(r'^DEFINE_REX_FUNC\(sub_([0-9A-F]{8})\)', re.M)
 DIR = re.compile(r'82[0-9A-Fa-f]{6}')
@@ -75,7 +75,7 @@ def main():
     for ruta in sorted(glob.glob(os.path.join(origen, '*.gcda'))):
         base = os.path.basename(ruta)
         cab, regs = gcda.leer(ruta)
-        m = re.search(r'#generated#default#(nfsmw_recomp\.\d+\.cpp)\.gcda$', base)
+        m = re.search(r'#generated#default#(ufc3-undisputed-nx_recomp\.\d+\.cpp)\.gcda$', base)
         quitar = set()
         if m:
             fichero = RAIZ_APP + '/generated/default/' + m.group(1)
@@ -96,9 +96,9 @@ def main():
                 regs[i][2] = struct.pack('<3I', gcda.ident_publica(nombre), lineno(otra[b], fichero, nombre), cfg)
                 cuentas['traducidas'] += 1
         else:
-            # app source: the file is deduced from the .gcda name (CMakeFiles#nfsmw.dir#src#x.cpp.gcda)
+            # app source: the file is deduced from the .gcda name (CMakeFiles#ufc3-undisputed-nx.dir#src#x.cpp.gcda)
             fuente = None
-            n = re.search(r'#nfsmw\.dir#(src#.+)\.gcda$', base)
+            n = re.search(r'#ufc3-undisputed-nx\.dir#(src#.+)\.gcda$', base)
             if n:
                 fuente = RAIZ_APP + '/' + n.group(1).replace('#', '/')
             for i, ident, lin, cfg, contadores in gcda.funciones(regs):

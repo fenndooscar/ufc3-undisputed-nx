@@ -42,7 +42,7 @@ def cargar_tabla(ruta):
     return seguras, todas
 
 
-# Names split in two to be pasted with ## (NFSMW_ESCENARIO_UNIR_(__imp__sub_824F, D7C0)): that way
+# Names split in two to be pasted with ## (UFC3_UNDISPUTED_NX_ESCENARIO_UNIR_(__imp__sub_824F, D7C0)): that way
 # tools/llamadas_directas.py does not count them as hooked. PAT does not see them; without translating them,
 # the NRO of another edition does not link or, worse, calls another function that in that edition sits
 # exactly at the Spanish address.
@@ -127,7 +127,7 @@ def main():
             escribir(rel, nuevo)
 
     # the rest of app/ that the build uses
-    for rel in ('CMakeLists.txt', 'CMakePresets.json', 'nfsmw.toml', 'orden_funciones.ld', 'overrides.toml',
+    for rel in ('CMakeLists.txt', 'CMakePresets.json', 'ufc3-undisputed-nx.toml', 'orden_funciones.ld', 'overrides.toml',
                 os.path.join('generated', 'rexglue.cmake')):
         texto = open(os.path.join(APP, rel), encoding='utf-8', newline='').read()
         if rel == 'CMakeLists.txt':
@@ -161,11 +161,11 @@ def main():
                       traducir_texto(linea, {**todas, **seguras}, set()))
     escribir('huecos.toml', ''.join(lineas))
 
-    manifiesto = open(os.path.join(APP, 'nfsmw_manifest.toml'), encoding='utf-8', newline='').read()
+    manifiesto = open(os.path.join(APP, 'ufc3_undisputed_nx_manifest.toml'), encoding='utf-8', newline='').read()
     manifiesto = manifiesto.replace('file_path = "../assets/game_root/default.xex"', 'file_path = "%s"' % xex)
     # the codegen requires the XEX to be inside game_root
     manifiesto = manifiesto.replace('game_root = "../assets/game_root"', 'game_root = "%s"' % os.path.dirname(xex))
-    escribir('nfsmw_manifest.toml', manifiesto)
+    escribir('ufc3_undisputed_nx_manifest.toml', manifiesto)
 
     # function partition seeded with the Spanish one. First the safe and the corrected pairs; a doubtful one
     # only if its slot is still free (a misplaced doubtful one can land on top of another function's exact pair).
@@ -188,7 +188,7 @@ def main():
     # since the last run of the tool.
     debil = re.compile(r'(?<![\w])sub_([0-9A-F]{8})\(ctx, base\);')
     enganchadas = set()
-    for ruta in glob.glob(os.path.join(APP, 'generated', 'default', 'nfsmw_recomp.*.cpp')):
+    for ruta in glob.glob(os.path.join(APP, 'generated', 'default', 'ufc3-undisputed-nx_recomp.*.cpp')):
         for x in debil.findall(open(ruta, encoding='utf-8').read()):
             d = todas.get(int(x, 16))
             enganchadas.add('sub_%08X' % (d if d is not None else int(x, 16)))

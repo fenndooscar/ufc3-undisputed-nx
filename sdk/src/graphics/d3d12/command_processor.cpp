@@ -10,8 +10,11 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <utility>
 
@@ -24,6 +27,9 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/d3d12/texture_cache.h>
+#include <rex/graphics/pipeline/shader/interpreter.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -47,7 +53,1984 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// SONDA TEMPORAL: cuenta por donde se van los dibujos. Quitar cuando la escena
+// negra este localizada.
+REXCVAR_DEFINE_INT32(ufc3_undisputed_nx_sonda_dibujos, 0, "UFC3_UNDISPUTED_NX",
+                     "Segundos entre informes del contador de dibujos (0 = apagado; solo pruebas)")
+    .range(0, 60)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace rex::graphics {
+REXCVAR_DECLARE(int32_t, ufc3_undisputed_nx_sonda_tinte);
+}
+
 namespace rex::graphics::d3d12 {
+
+namespace {
+// Cuantas texturas distintas se recuerdan por par de shaders. Con la clave por
+// direccion base entran la piel, los pantalones, los guantes y las variantes del
+// rival, asi que hacen falta mas que con la clave por indice de fetch constant.
+static constexpr uint32_t kTexMax = 32;
+// Cuantos bytes de cada textura se recorren para su huella de contenido, y cada cuantos
+// dibujos del par se hace la parte cara de la sonda (interprete + huellas). El cuerpo
+// negro que hay que cazar aparece y desaparece entre fotogramas con todos los agregados
+// iguales, asi que la sonda mira el dibujo suelto; pero leer 4 KB por textura en cada
+// dibujo serian cientos de MB/s, de ahi el muestreo.
+static constexpr uint32_t kBytesHuella = 2048;
+static constexpr uint64_t kCadaCaro = 64;
+// Hashes from this UFC build's CAF census and material-tag capture: skin and hair.
+// Reuse the bounded, opt-in captures to compare both materials' actual inputs.
+static bool IsDiagnosticMaterial(uint64_t hash) {
+  return hash == 0xC8F8C8858B1E1E5Eull || hash == 0x2C56B11C103C5673ull;
+}
+// SONDA TEMPORAL: ejecuta el shader de vertices del invitado en el interprete y
+// recoge lo que escribe en los interpoladores. Es la unica forma de ver lo que
+// el shader de pixeles recibe de verdad: la traduccion a DXBC es fiel (esta
+// leida linea a linea), las texturas estan cargadas y las constantes del banco
+// de vertices son las que son, asi que lo que falta por medir es el valor que
+// sale del shader de vertices hacia el de pixeles. El interprete usa el mismo
+// fichero de registros y la misma memoria que el shader real, no una copia.
+class SondaSalidaVertices : public ShaderInterpreter::ExportSink {
+ public:
+  void Reset() {
+    interpolador[0] = interpolador[1] = interpolador[2] = false;
+    for (uint32_t i = 0; i < 3; ++i) {
+      for (uint32_t j = 0; j < 4; ++j) {
+        valor[i][j] = 0.0f;
+      }
+      mascara[i] = 0;
+    }
+  }
+  void Export(ucode::ExportRegister registro, const float* valor_exportado,
+              uint32_t mascara_exportada) override {
+    uint32_t indice;
+    switch (registro) {
+      case ucode::ExportRegister::kVSInterpolator0:
+        indice = 0;
+        break;
+      case ucode::ExportRegister::kVSInterpolator1:
+        indice = 1;
+        break;
+      case ucode::ExportRegister::kVSInterpolator2:
+        indice = 2;
+        break;
+      default:
+        return;
+    }
+    std::memcpy(valor[indice], valor_exportado, sizeof(valor[indice]));
+    mascara[indice] = mascara_exportada;
+    interpolador[indice] = true;
+  }
+  float valor[3][4] = {};
+  uint32_t mascara[3] = {};
+  bool interpolador[3] = {};
+};
+
+// Un ESTADO DE MATERIAL, no un dibujo. El sintoma que hay que explicar
+// (BRIEFING_CAF.md, UPDATE 22) es que el cuerpo del luchador creado se pone negro entre
+// dos fotogramas sin que cambie ningun fetch constant; si el material del dibujo no
+// cambia, lo que cambia esta mas abajo y hay que mirar el dibujo suelto. Lo que se
+// guarda por par de shaders es la LISTA DE ESTADOS DISTINTOS que ese par usa, con
+// cuantos dibujos lleva cada uno: comparar la pelea de luchadores normales con la del
+// creado es comparar dos listas, y eso no llena el disco.
+struct SondaDibujo {
+  uint64_t vs = 0, ps = 0;
+  uint32_t prim_visitante = 0, prim_anfitrion = 0, indices = 0, vertices = 0;
+  uint32_t mascara_vs = 0, mascara_ps = 0;
+  uint32_t c1[4] = {}, c2[4] = {}, c162[4] = {}, c37[4] = {};
+  uint32_t color_cntl = 0, blend0 = 0, color_mask = 0, depth_cntl = 0, sc_mode = 0;
+  uint32_t color_info = 0, depth_info = 0, surf_info = 0;
+  uint32_t has_ps = 0, mata = 0, escribe_color = 0, escribe_prof = 0;
+  uint32_t interp_v1[4] = {}, interp_v2[4] = {}, interp_uv[4] = {};
+  uint32_t interp_v1_bits[4] = {}, interp_uv_bits[4] = {};
+  uint32_t vfetch0_dir = 0, vfetch0_largo = 0, vfetch0_tipo = 0, vfetch0_stride = 0;
+  uint32_t vfetch0_bytes[8] = {};
+  // Las constantes BOOLEANAS del invitado, que es lo que el shader de vertices usa para
+  // elegir rama: el microcodigo tiene `cjmp b0, L37`, `cjmp !b1, L9`, `cjmp !b2, L17`,
+  // `cjmp !b3, L27` y `cexec b4`, y cada rama calcula o0 de una manera distinta. Si la
+  // rama elegida no es la que la consola elige, o0 lleva otra cosa (una posicion en vez
+  // de una UV) y el shader de pixeles muestrea la textura con coordenadas que no son
+  // UV: eso da justo un mosaico que se mueve con el luchador.
+  uint32_t bools[8] = {};
+  uint32_t bools_extra[4] = {};
+  uint32_t tex_n = 0;
+  struct Tex {
+    uint32_t fc = 0, base = 0, mip = 0, fmt = 0, ancho = 0, alto = 0;
+    uint32_t swizzle_host = 0, signos = 0, niveles = 0, semilla = 0;
+    int32_t delta_media = 0;
+    uint32_t enrt = 0;
+    uint32_t indice_sin_signo = 0, indice_con_signo = 0;
+  };
+  Tex tex[8];
+  // Cuantos dibujos usaron este estado, y cuando se vio por primera y ultima vez.
+  uint64_t veces = 0;
+  char primera[24] = {}, ultima[24] = {};
+  uint32_t huella_barata = 0;
+  // Los 8 bytes crudos del bloque DXT1 que el shader muestrea en ESTE estado, sacados
+  // de la memoria del invitado con las UV del estado. Es el numero que decide el color:
+  // todo lo demas (constantes, sampler, fetch constant) puede estar bien y el bloque
+  // ser negro. Se guardan crudos y se descodifican fuera, con el lector ya probado.
+  uint32_t bloque_fc0[2] = {}, bloque_fc3[2] = {};
+  uint32_t bloque_uv0[2] = {}, bloque_uv3[2] = {};   // texel al que apuntan
+  uint32_t bloque_ok = 0;                            // 1 si se pudieron leer
+};
+
+struct SondaDibujos {
+  uint64_t total = 0, pintados = 0, vertices = 0;
+  uint64_t sin_vs = 0, pitch0 = 0, sin_raster = 0, sin_vertices = 0;
+  uint64_t pipeline_fallido = 0, async_pendiente = 0, bindings_fallido = 0;
+  // Fetch de vertices que el shader pide y que el juego no tenia puestos: la
+  // malla desaparece sin que se note en los contadores de dibujos.
+  uint64_t vfetch_invalido = 0, vfetch_sin_rango = 0;
+  uint64_t memexport = 0, sin_ps = 0, swaps = 0, copias = 0, sin_rt = 0;
+  uint64_t fmt_color[96] = {}, fmt_prof[96] = {};
+  uint64_t ultimo_vs = 0, ultimo_ps = 0;
+  std::chrono::steady_clock::time_point ultimo = std::chrono::steady_clock::now();
+
+  // Que pares (shader de vertices, shader de pixeles) pintan cada intervalo.
+  // Comparar la fase buena (modo demostracion) con la mala (entrenamiento de
+  // carrera) dice que shaders son los de la escena negra.
+  struct ParShaders {
+    uint64_t vs = 0, ps = 0, dibujos = 0, vertices = 0;
+    uint32_t recorte[4] = {};  // x0, y0, x1, y1 del scissor del primer dibujo
+    uint32_t vista[2] = {};    // ancho, alto del viewport del primer dibujo
+    uint32_t vs_const_no_cero = 0, ps_const_no_cero = 0;
+    uint32_t vs_c0[4] = {};
+    // Estado del destino: si la escena 3D cae en otra superficie que la que se
+    // resuelve a la ventana, se vera negra aunque los dibujos sean correctos.
+    uint32_t color_info = 0, depth_info = 0, surface_info = 0, modecontrol = 0;
+    uint32_t color_mask = 0, blend0 = 0, sc_mode_cntl = 0, clip_cntl = 0;
+    // Si el test de profundidad descarta todo, la malla se dibuja y no se ve.
+    // depth_info solo dice donde esta el buzon, no como se prueba.
+    uint32_t depth_control = 0, stencil_ref_mask = 0;
+    // PA_CL_VTE_CNTL decide si la posicion sale dividida por W y en que rango
+    // esta Z. Con los bits mal puestos todos los vertices caen al mismo sitio.
+    uint32_t vte_cntl = 0;
+    // Lo que el analisis del microcodigo dice del shader de pixeles de este par.
+    uint32_t ps_escribe_color = 0, ps_escribe_prof = 0, ps_mata_pixeles = 0, ps_exporta = 0;
+    uint32_t vs_exporta = 0;
+    // RB_COLORCONTROL: si la prueba de alfa esta activa con una funcion que
+    // descarta todo, el color nunca llega aunque colorMask y blend esten bien.
+    uint32_t color_control = 0;
+    // Las texturas que el shader de pixeles muestrea, con sus seis dwords. Si el
+    // tipo no es "textura", o no hay pagina base ni de mip, la cache descarta la
+    // textura en silencio y el muestreo devuelve (0,0,0,0): el luchador sale sin
+    // texturas, negro si el color se multiplica por el muestreo y transparente
+    // si el alfa sale de ahi.
+    //
+    // La tabla se llena en TODOS los dibujos del par, no solo en el primero: el
+    // cuerpo, los pantalones y los guantes son dibujos distintos, asi que mirar
+    // solo el primero hace creer que la textura del cuerpo es la de los guantes.
+    // La clave es el indice del fetch constant, que es lo que el shader nombra.
+    uint32_t tex_usadas = 0, tex_malas = 0, tex_sin_pagina = 0;
+    uint32_t tex_huecos = 0;
+    uint32_t tex_fc[kTexMax] = {}, tex_tipo[kTexMax] = {}, tex_base[kTexMax] = {},
+             tex_mip[kTexMax] = {}, tex_fmt[kTexMax] = {}, tex_wh[kTexMax][2] = {},
+             tex_dw[kTexMax][6] = {};
+    // Cuantos dibujos de este par usaron cada textura, y si su pagina base cae
+    // dentro de una resolucion de render target reciente. Una textura hecha en
+    // tiempo de ejecucion (la piel y los tatuajes de un luchador creado por el
+    // jugador) sale de ahi, y su contenido depende de que la escritura al buzon
+    // y la lectura de la textura se compongan bien.
+    uint32_t tex_dibujos[kTexMax] = {}, tex_en_rt[kTexMax] = {};
+    uint32_t tex_endian[kTexMax] = {}, tex_tiled[kTexMax] = {}, tex_exp_adjust[kTexMax] = {},
+             tex_num_format[kTexMax] = {};
+    // Los primeros dwords en la pagina base de cada textura: si son todos cero,
+    // los datos de la textura no estan en la memoria del invitado y por eso el
+    // muestreo da negro, aunque la clave de la textura sea valida.
+    uint32_t tex_bytes[kTexMax][8] = {}, tex_bytes_leidos[kTexMax] = {};
+    // Y de toda la textura: que parte son ceros y cuantos valores distintos hay.
+    // Una textura que nunca se subio es casi toda ceros.
+    uint32_t tex_ceros[kTexMax] = {}, tex_varios[kTexMax] = {}, tex_bytes_vistos[kTexMax] = {};
+    // Lo que la cache de texturas dice de cada una DESPUES de pedirlas: si el
+    // enlace existe y si tiene textura de host. Un enlace nulo o sin textura se
+    // convierte en un muestreo de (0,0,0,0), que es negro si el color se
+    // multiplica por el y transparente si el alfa sale de ahi.
+    uint32_t tex_enlace[kTexMax] = {}, tex_objeto[kTexMax] = {}, tex_swizzle[kTexMax] = {};
+    // Los signos que el shader de pixeles va a leer de "texture_swizzled_signs"
+    // para cada una. El muestreo elige entre la version con signo y sin signo
+    // de la textura segun ellos, y el codigo de conversion de formato del
+    // shader traduce el valor. Con signo "gamma" (3) el muestreo aplica ademas
+    // la conversion de gamma a lineal: si la textura ya viniera en lineal, ese
+    // paso la oscurece.
+    uint32_t tex_signos[kTexMax] = {};
+    float vport_zscale = 0.0f, vport_zoffset = 0.0f;
+    // Sondas de vertices: los fetch de tipo vertice que el juego tenia puestos,
+    // con su direccion y tamano (en dwords). Si la malla sale negra y estos
+    // apuntan a memoria sin asignar, el problema esta aqui, no en el shader.
+    uint32_t vfetch[6][3] = {};  // indice, direccion, tamano
+    uint32_t vfetch_tipo[6] = {};
+    uint32_t vfetch_leidos = 0;
+    uint32_t prim = 0, indices = 0;
+    // Y los primeros dwords del primer buffer de vertices, tal cual.
+    uint32_t vfetch_bytes[32] = {};
+    uint32_t vfetch_bytes_leidos = 0;
+    // Los registros de constante que el desensamblado del shader nombra uno por
+    // uno. El analisis de microcodigo decide cuantas constantes se suben al
+    // cbuffer y en que orden; si esa cuenta no cuadra con lo que el shader lee,
+    // el shader recibe el valor de otra constante y la escena sale negra o
+    // transparente sin que nada avise.
+    uint32_t vs_mapa[2] = {};              // float_count, direccionamiento dinamico
+    uint32_t ps_mapa[2] = {};
+    uint32_t ps_c[5][4] = {};              // c195, c242, c243, c254, c255
+    uint32_t ps_c_usadas = 0;              // cuantas de las cinco se pudieron leer
+    uint32_t vs_c74[4][4] = {};            // c74..c77, la primera matriz de hueso
+    // Mapa de que constantes flotantes del banco de vertices son distintas de
+    // cero, 256 bits en 64 caracteres hexadecimales. El shader de vertices del
+    // luchador calcula su color de vertice a partir de c1, c2, c9, c10, c37,
+    // c162, c196, c205 y c213; si esas son cero, el color de vertice sale cero,
+    // el shader de pixeles multiplica la textura por el y el luchador sale
+    // negro sin que falle ni una textura ni un enlace. Es la unica forma de
+    // distinguir "la constante esta a cero" de "la constante no se subio".
+    char vs_mapa_ceros[65] = {};
+    // Las constantes del banco de vertices que el desensamblado del shader del
+    // luchador nombra para calcular el color de vertice y el factor de mezcla
+    // del borde. Si son cero, el color de vertice sale cero.
+    static constexpr uint32_t kIndicesVs[16] = {1,  2,   9,   10,  31, 37, 54, 55,
+                                                56, 57,  162, 196, 205, 213, 255, 0};
+    uint32_t vs_c[16][4] = {};
+    // El muestreador que el emulador construye de verdad para cada textura que el
+    // shader de pixeles lee, y no solo los campos del fetch constant: la cache
+    // reescribe el filtro (anisotropic_override = 3 fuerza 4x en cuanto la textura
+    // tiene mips, y todas las de este juego tienen 4 niveles) y fija MinLOD y
+    // MaxLOD. Si el cuerpo del luchador creado sale embadurnado y el nivel base de
+    // su textura esta bien, la pregunta es que nivel esta leyendo, y eso lo decide
+    // el muestreador, no el fetch constant.
+    struct Muestreador {
+      uint32_t fc = 0;
+      uint32_t fetch_mag = 0, fetch_min = 0, fetch_mip = 0, fetch_aniso = 0;
+      uint32_t fetch_lod_bias = 0;      // crudo, 5 bits fraccionarios
+      uint32_t fetch_mip_min = 0, fetch_mip_max = 0;
+      uint32_t muestreador_valor = 0;   // SamplerParameters::value
+      uint32_t muestreador_mag = 0, muestreador_min = 0, muestreador_mip = 0;
+      uint32_t muestreador_aniso = 0, muestreador_mip_min = 0, muestreador_base_map = 0;
+      uint32_t clamp = 0;
+      uint32_t usos = 0;
+    };
+    Muestreador muestreadores[8];
+    uint32_t muestreadores_usados = 0;
+    // Lo que el shader muestrea DE VERDAD, no lo que pide el fetch constant: el
+    // indice dentro del monton de descriptores sin enlazar y la clave de la textura
+    // que ese indice resuelve AHORA MISMO. Todo lo demas que mira la sonda es la
+    // peticion del invitado; esto es el resultado. Sirve para el sintoma mas duro
+    // que hay: el cuerpo del luchador creado se pone negro entre dos fotogramas sin
+    // que cambie ni una constante ni un fetch constant, asi que lo que cambia tiene
+    // que estar aqui o mas abajo.
+    struct EnlaceReal {
+      uint32_t fc = 0;
+      uint32_t indice_sin_signo = 0xFFFFFFFFu;   // lo que lee el shader si signos = 00
+      uint32_t indice_con_signo = 0xFFFFFFFFu;   // lo que lee si signos != 00
+      uint32_t firma_desc_sin = 0, firma_desc_con = 0;
+      uint32_t base = 0, mip = 0, fmt = 0, ancho = 0, alto = 0;
+      uint32_t niveles = 0, swizzle_host = 0, signos = 0;
+      uint32_t es_firmado = 0, banderas_clave = 0;
+      uint32_t signos_sistema = 0;
+      uint32_t usos = 0;
+    };
+    EnlaceReal enlaces_reales[8];
+    uint32_t enlaces_reales_usados = 0;
+    // La identidad del monton de descriptores del fotograma: sin esto, un indice no
+    // dice a que recurso apunta. Se rellena una vez por informe.
+    uint64_t descriptor_heap_pixel = 0;
+    uint32_t descriptor_buffer_pixel = 0;
+    // Los estados de material DISTINTOS que ha usado este par, con cuantas veces cada
+    // uno. Es la tabla que hay que comparar entre la pelea normal y la del luchador
+    // creado: si en la normal el cuerpo aparece con el estado A y en la del creado con
+    // el estado B, la diferencia entre A y B es el fallo.
+    static constexpr uint32_t kEstadosMax = 32;
+    SondaDibujo estados[kEstadosMax];
+    uint32_t estados_usados = 0;
+    uint64_t dibujos_del_par = 0;
+    uint64_t estados_saturados = 0;
+    uint32_t huella_impresa = 0;
+    // El ultimo juego de texturas e interpoladores medidos, para no perderlos en los
+    // dibujos en que la parte cara de la sonda no corre.
+    SondaDibujo::Tex tex_ultimas[8];
+    uint32_t tex_ultimas_n = 0;
+    uint32_t interp_uv_ultimo[4] = {}, interp_v1_ultimo[4] = {}, interp_v2_ultimo[4] = {};
+    // Seguimiento del CONTENIDO de cada textura del par a lo largo de la sesion: el
+    // minimo y el maximo de la media de sus primeros bytes, cuantas huellas distintas
+    // se han visto y cuando estuvo mas oscura. El cuerpo del luchador creado se pone
+    // negro entre fotogramas con todos los agregados iguales; si su textura pasa de
+    // gris a negro y vuelve, aqui se ve, con la hora.
+    struct SeguimientoTex {
+      uint32_t base = 0, fc = 0, usada = 0;
+      uint32_t media_min = 256, media_max = 0, media_ultima = 0;
+      uint32_t huellas = 0, huella_ultima = 0;
+      char hora_min[24] = {};
+    };
+    SeguimientoTex seguimiento[32];
+    uint32_t seguimiento_usado = 0;
+    // Los seis dwords crudos del fetch de vertice que el shader usa, con el
+    // endian y el exp_adjust, mas el formato del render target de color 0. La
+    // posicion del vertice sale como basura si el endian no es el que toca, y
+    // el color de salida se escala por 2^color_exp_bias: con 8_8_8_8 es 1, y
+    // un exponente distinto apaga la escena entera sin que falle nada mas.
+    uint32_t vs_vfetch_dw[2] = {};
+    uint32_t color_info0 = 0, color_mask0 = 0;
+    // Lo que el shader de vertices escribe en los interpoladores, tal cual sale
+    // del interprete. Es lo que el shader de pixeles recibe como v0, v1 y v2.
+    uint32_t vs_salida[3][4] = {};
+    uint32_t vs_salida_mascara[3] = {};
+    uint32_t vs_salida_leida = 0;
+    // El color de vertice (o1 = TEXCOORD1 = lo que el shader de pixeles lee como
+    // v1 y multiplica por la textura) y las UV (o0), recorriendo VARIOS vertices
+    // del dibujo. Si el minimo del color es cero, hay vertices con color negro y
+    // la malla interpolada sale apagada aunque la textura este bien.
+    uint32_t v1_leidos = 0;
+    float interp_min[3][4] = {}, interp_max[3][4] = {}, interp_media[3][4] = {};
+    // Escala de resolucion con la que se dibuja este par y muestras del destino.
+    // Con escala mayor que 1 el shader de pixeles multiplica las UV por ella
+    // para que el muestreo caiga bien sobre la textura, y un error ahi manda
+    // todas las muestras al mismo texel: la malla sale plana y apagada sin que
+    // falle ni una textura ni un enlace.
+    uint32_t ancho_vista = 0, alto_vista = 0, muestras = 0;
+  };
+  // Las constantes del banco de vertices que el desensamblado del shader del
+  // luchador nombra para calcular el color de vertice.
+  static constexpr uint32_t kIndicesVs[16] = {1,  2,   9,   10,  31, 37, 54, 55,
+                                              56, 57,  162, 196, 205, 213, 255, 0};
+  static constexpr uint32_t kParesMax = 256;
+  ParShaders pares[kParesMax];
+  uint32_t pares_usados = 0;
+
+  // Destino de la ultima resolucion de la ventana: si la escena 3D se resuelve
+  // a una direccion distinta de la que luego se presenta, se vera negra aunque
+  // se dibuje bien.
+  uint32_t copia_destino = 0, copia_longitud = 0, copia_repeticiones = 0;
+  // Cuantas resoluciones escriben ENCIMA del front buffer. Si hay mas de una por
+  // fotograma, la segunda puede estar tapando lo que pinto la primera.
+  uint64_t copias_frente = 0;
+  // Las direcciones a las que se ha resuelto un render target, para poder
+  // reconocer una textura hecha en tiempo de ejecucion.
+  std::set<uint32_t> copias_recientes;
+  uint32_t swap_ptr = 0, swap_ancho = 0, swap_alto = 0;
+
+  // Flujos memexport vistos.
+  uint64_t memexport_rangos = 0, memexport_bytes = 0;
+  // Los ultimos flujos exportados: la malla de un luchador se dibuja en un
+  // fotograma posterior al que la exporta, asi que hay que comparar contra estos
+  // y no contra los del propio dibujo.
+  std::vector<draw_util::MemExportRange> me_recientes;
+  // Por que un dibujo que exporta memoria acaba sin ningun rango. Si el juego
+  // escribe eM# pero "AddMemExportRanges" (draw.cpp:641) descarta todas las
+  // constantes de flujo por sus comprobaciones de cordura, no hay nada que
+  // acotar, el destino real se queda sin invalidar y la malla del luchador sale
+  // negra o colapsada (xenia-canary #1093). Los dos casos son silenciosos.
+  uint64_t me_shaders = 0, me_sin_constantes = 0, me_rechazadas = 0, me_aceptadas = 0;
+  uint32_t me_constante = 0, me_eM = 0, me_es_vertice = 0;
+  uint32_t me_dwords[4] = {};
+  uint32_t me_ok_constante = 0, me_ok_dwords[4] = {};
+  // Del primer flujo aceptado: formato, numero de indices y lo que ocupa. Si el
+  // tamano calculado (indices * bytes por pixel) es mayor que lo reservado, el
+  // acotado de #1093 importa; si no, el problema es otro.
+  uint32_t me_ok_formato = 0, me_ok_indices = 0, me_primer_base = 0, me_primer_largo = 0;
+  uint32_t me_rango_max = 0, me_rango_max_base = 0;
+  // Vertices que el juego lee de memoria que un memexport acaba de escribir: si
+  // la malla del luchador sale de aqui, el problema es el flujo exportado y no
+  // los buffers de vertices ni las texturas.
+  uint64_t vfetch_en_export = 0, vfetch_total = 0;
+  uint32_t vfetch_export_dir = 0, vfetch_export_largo = 0;
+  uint32_t vfetch_export_rango = 0, vfetch_export_rango_largo = 0;
+
+
+  // Cuenta los flujos memexport de cada dibujo para el informe. El recorte a la
+  // reserva del invitado ya no vive aqui: lo hace "ClampMemExportRangeToAllocation"
+  // en draw.cpp, que es comun a los dos backends, asi que a este punto los
+  // rangos ya llegan acotados.
+  void AnotaMemexport(const draw_util::MemExportRange& rango, memory::Memory* memory) {
+    if (REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) <= 0) {
+      return;
+    }
+    ++memexport_rangos;
+    memexport_bytes += rango.size_bytes;
+    if (memory == nullptr) {
+      return;
+    }
+    me_recientes.push_back(rango);
+    if (me_recientes.size() > 64) {
+      me_recientes.erase(me_recientes.begin());
+    }
+    if (me_primer_largo == 0) {
+      me_primer_base = rango.base_address_dwords << 2;
+      me_primer_largo = rango.size_bytes;
+    }
+    if (rango.size_bytes > me_rango_max) {
+      me_rango_max = rango.size_bytes;
+      me_rango_max_base = rango.base_address_dwords << 2;
+    }
+  }
+
+  // Reproduce, solo para contarlo, el filtro de "AddMemExportRanges": dice si el
+  // shader no declara ninguna constante de flujo o si las que declara no pasan
+  // las comprobaciones de cordura. Guarda los cuatro dwords de la primera
+  // rechazada, que es lo que hace falta para entender por que.
+  void AnotaStreams(const RegisterFile& regs, const Shader& shader, bool es_vertice) {
+    if (REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) <= 0) {
+      return;
+    }
+    ++me_shaders;
+    me_eM = shader.memexport_eM_written();
+    me_es_vertice = es_vertice ? 1 : 0;
+    const std::set<uint32_t>& constantes = shader.memexport_stream_constants();
+    if (constantes.empty()) {
+      ++me_sin_constantes;
+      return;
+    }
+    const uint32_t base = es_vertice ? regs.Get<reg::SQ_VS_CONST>().base
+                                     : regs.Get<reg::SQ_PS_CONST>().base;
+    for (uint32_t indice : constantes) {
+      const xenos::xe_gpu_memexport_stream_t flujo = regs.GetMemExportStream(base + indice);
+      if (flujo.const_0x1 != 0x1 || flujo.const_0x4b0 != 0x4B0 || flujo.const_0x96 != 0x96 ||
+          !flujo.index_count) {
+        ++me_rechazadas;
+        if (me_rechazadas == 1) {
+          me_constante = base + indice;
+          me_dwords[0] = flujo.dword_0;
+          me_dwords[1] = flujo.dword_1;
+          me_dwords[2] = flujo.dword_2;
+          me_dwords[3] = flujo.dword_3;
+        }
+      } else {
+        ++me_aceptadas;
+        if (me_aceptadas == 1) {
+          me_ok_constante = base + indice;
+          me_ok_dwords[0] = flujo.dword_0;
+          me_ok_dwords[1] = flujo.dword_1;
+          me_ok_dwords[2] = flujo.dword_2;
+          me_ok_dwords[3] = flujo.dword_3;
+          me_ok_formato = uint32_t(flujo.format);
+          me_ok_indices = flujo.index_count;
+        }
+      }
+    }
+  }
+
+  // Una textura entera del invitado a disco, con cabecera DDS para poder abrirla
+  // directamente. Se salta las que ya se volcaron y las que pasan de 8 MB.
+  //
+  // Se guarda CON el canje de bytes que aplica el cargador segun el campo
+  // "endianness" del fetch constant, porque esos son los bytes que ve la GPU.
+  // Guardar los crudos de memoria fue un error que costo tiempo: la imagen sale
+  // con los colores cambiados (violeta y verde en una textura de piel) y parece
+  // que la textura esta rota cuando en realidad esta bien. Los crudos se guardan
+  // aparte, con el sufijo "_crudo", solo para poder comparar.
+  //
+  // El tamano sale de la MISMA cuenta que usa la cache (TextureGuestLayout), no de
+  // "ancho*alto*bpp/8": el invitado guarda las texturas lineales con la fila de
+  // bloques alineada a 256 bytes, asi que la cuenta empaquetada se queda corta en
+  // cuanto la textura es mas estrecha que eso y la parte de abajo nunca se miraba.
+  // Costo una conclusion falsa: el "azul" de la ventana de 0x171EC caia fuera de
+  // los bytes escritos. `row_pitch` va en el nombre para que se vea a simple vista.
+  // Tamano real en memoria del invitado del nivel base de una textura, con la
+  // MISMA cuenta que usa la cache para pedir los rangos residentes. La cuenta
+  // empaquetada "ancho*alto*bpp/8" se queda corta en cuanto la textura es mas
+  // estrecha que la alineacion de fila de 256 bytes que el invitado usa en las
+  // lineales, y ese trozo de abajo nunca se volcaba.
+  static uint32_t BytesDelNivelBase(const xenos::xe_gpu_texture_fetch_t& t, uint32_t ancho,
+                                    uint32_t alto, uint32_t* fila_out) {
+    texture_util::TextureGuestLayout dispo = texture_util::GetGuestTextureLayout(
+        t.dimension, t.pitch, ancho, alto, 1, bool(t.tiled),
+        xenos::TextureFormat(t.format), bool(t.packed_mips), true,
+        std::max(t.mip_min_level, t.mip_max_level));
+    if (fila_out != nullptr) {
+      *fila_out = dispo.base.row_pitch_bytes;
+    }
+    return dispo.base.level_data_extent_bytes;
+  }
+
+  // El muestreador real por textura del shader de pixeles: los campos del fetch
+  // constant, el SamplerParameters que la cache construye de ellos y el numero de
+  // niveles que tiene la textura en el host. La diferencia entre lo que pide el
+  // invitado y lo que acaba en el heap de muestreadores es lo que hay que ver.
+  void AnotaMuestreadores(ParShaders& par, const Shader* ps_shader, const RegisterFile& regs,
+                          const D3D12TextureCache* cache) {
+    if (ps_shader == nullptr || cache == nullptr) {
+      return;
+    }
+    const D3D12Shader& shader = static_cast<const D3D12Shader&>(*ps_shader);
+    for (const Shader::TextureBinding& enlace : shader.texture_bindings()) {
+      if (enlace.fetch_constant >= 32) {
+        continue;
+      }
+      uint32_t hueco = par.muestreadores_usados;
+      for (uint32_t i = 0; i < par.muestreadores_usados; ++i) {
+        if (par.muestreadores[i].fc == enlace.fetch_constant) {
+          hueco = i;
+          break;
+        }
+      }
+      if (hueco >= rex::countof(par.muestreadores)) {
+        continue;
+      }
+      ParShaders::Muestreador& m = par.muestreadores[hueco];
+      if (hueco == par.muestreadores_usados) {
+        m = ParShaders::Muestreador{};
+        m.fc = enlace.fetch_constant;
+        ++par.muestreadores_usados;
+      }
+      ++m.usos;
+      const xenos::xe_gpu_texture_fetch_t t = regs.GetTextureFetch(enlace.fetch_constant);
+      const ParsedTextureFetchInstruction& instr = enlace.fetch_instr;
+      m.fetch_mag = uint32_t(t.mag_filter);
+      m.fetch_min = uint32_t(t.min_filter);
+      m.fetch_mip = uint32_t(t.mip_filter);
+      m.fetch_aniso = uint32_t(t.aniso_filter);
+      m.fetch_lod_bias = uint32_t(int32_t(t.lod_bias) & 0x3FF);
+      uint32_t min_nivel = 0, max_nivel = 0;
+      texture_util::GetSubresourcesFromFetchConstant(t, nullptr, nullptr, nullptr, nullptr,
+                                                     nullptr, &min_nivel, &max_nivel);
+      m.fetch_mip_min = min_nivel;
+      m.fetch_mip_max = max_nivel;
+      // Lo que la instruccion de muestreo impone, por encima del fetch constant.
+      if (instr.attributes.mag_filter != xenos::TextureFilter::kUseFetchConst) {
+        m.fetch_mag = uint32_t(instr.attributes.mag_filter);
+      }
+      if (instr.attributes.min_filter != xenos::TextureFilter::kUseFetchConst) {
+        m.fetch_min = uint32_t(instr.attributes.min_filter);
+      }
+      if (instr.attributes.mip_filter != xenos::TextureFilter::kUseFetchConst) {
+        m.fetch_mip = uint32_t(instr.attributes.mip_filter);
+      }
+      if (instr.attributes.lod_bias != 0.0f) {
+        m.fetch_lod_bias = uint32_t(int32_t(instr.attributes.lod_bias * 32.0f) & 0x3FF);
+      }
+      // La firma real que acaba en el heap. Se busca el enlace de muestreador del
+      // mismo fetch constant ya traducido, que es el que la cache convierte.
+      if (cache != nullptr) {
+        for (const D3D12Shader::SamplerBinding& sb :
+             shader.GetSamplerBindingsAfterTranslation()) {
+          if (sb.fetch_constant != enlace.fetch_constant) {
+            continue;
+          }
+          D3D12TextureCache::SamplerParameters p = cache->GetSamplerParameters(sb);
+          m.muestreador_valor = p.value;
+          m.muestreador_mag = p.mag_linear;
+          m.muestreador_min = p.min_linear;
+          m.muestreador_mip = p.mip_linear;
+          m.muestreador_aniso = uint32_t(p.aniso_filter);
+          m.muestreador_mip_min = p.mip_min_level;
+          m.muestreador_base_map = p.mip_base_map;
+          m.clamp = uint32_t(p.clamp_x) | (uint32_t(p.clamp_y) << 3) | (uint32_t(p.clamp_z) << 6);
+          break;
+        }
+      }
+    }
+  }
+
+  // El enlace REAL de las texturas del shader de pixeles: el indice dentro del monton
+  // de descriptores y la clave de textura que resuelve. Se lee del BUFFER que el
+  // fotograma ya subio (current_texture_srv_keys_pixel_), no volviendo a preguntar a
+  // la cache: preguntar otra vez da la respuesta de ahora, no la que el dibujo usa.
+  // La cache solo se toca para los casos que el buffer no cubre (dimension forzada,
+  // version con signo), que son los mismos que trata UpdateBindings.
+  void AnotaEnlacesReales(ParShaders& par, const Shader* ps_shader, const RegisterFile& regs,
+                          D3D12TextureCache* cache,
+                          const std::vector<D3D12TextureCache::TextureSRVKey>* claves,
+                          uint64_t monton, uint32_t tam_descriptor) {
+    par.descriptor_heap_pixel = monton;
+    par.descriptor_buffer_pixel = tam_descriptor;
+    if (ps_shader == nullptr || cache == nullptr) {
+      return;
+    }
+    const D3D12Shader& shader = static_cast<const D3D12Shader&>(*ps_shader);
+    const std::vector<D3D12Shader::TextureBinding>& enlaces =
+        shader.GetTextureBindingsAfterTranslation();
+    // Las claves solo valen si son de ESTE shader: el buffer se reutiliza mientras el
+    // uid de composicion no cambie, y con otro shader los indices no corresponden.
+    const bool claves_validas =
+        claves != nullptr && claves->size() == enlaces.size() && !enlaces.empty();
+    for (size_t i = 0; i < enlaces.size(); ++i) {
+      const D3D12Shader::TextureBinding& e = enlaces[i];
+      if (e.fetch_constant >= 32) {
+        continue;
+      }
+      uint32_t hueco = par.enlaces_reales_usados;
+      for (uint32_t j = 0; j < par.enlaces_reales_usados; ++j) {
+        if (par.enlaces_reales[j].fc == e.fetch_constant) {
+          hueco = j;
+          break;
+        }
+      }
+      if (hueco >= rex::countof(par.enlaces_reales)) {
+        continue;
+      }
+      ParShaders::EnlaceReal& r = par.enlaces_reales[hueco];
+      if (hueco == par.enlaces_reales_usados) {
+        r = ParShaders::EnlaceReal{};
+        r.fc = e.fetch_constant;
+        r.indice_sin_signo = UINT32_MAX;
+        r.indice_con_signo = UINT32_MAX;
+        ++par.enlaces_reales_usados;
+      }
+      ++r.usos;
+      // Los DOS indices que el shader puede elegir en caliente: el DXBC del camino
+      // sin enlazar consulta la ranura sin signo y la ranura con signo, y elige con
+      // el byte de signos del sistema. Informar solo la que lleva la bandera
+      // `is_signed` del enlace da el descriptor nulo para todos, que es lo que
+      // UpdateBindings deja cuando el formato no tiene version con signo aparte: no
+      // es el fallo, es la ranura que el shader no lee. Hay que dar las dos.
+      D3D12Shader::TextureBinding e_sin = e;
+      e_sin.is_signed = false;
+      r.indice_sin_signo = cache->GetActiveTextureBindlessSRVIndex(e_sin);
+      D3D12Shader::TextureBinding e_con = e;
+      e_con.is_signed = true;
+      r.indice_con_signo = cache->GetActiveTextureBindlessSRVIndex(e_con);
+      const xenos::xe_gpu_texture_fetch_t t = regs.GetTextureFetch(e.fetch_constant);
+      uint32_t ancho = 0, alto = 0, base = 0, mip = 0, min_nivel = 0, max_nivel = 0;
+      texture_util::GetSubresourcesFromFetchConstant(t, &ancho, &alto, nullptr, &base, &mip,
+                                                     &min_nivel, &max_nivel);
+      r.base = base;
+      r.mip = mip;
+      r.fmt = uint32_t(t.format);
+      r.ancho = ancho + 1;
+      r.alto = alto + 1;
+      r.niveles = max_nivel - min_nivel + 1;
+      if (claves_validas) {
+        const D3D12TextureCache::TextureSRVKey& clave = (*claves)[i];
+        r.firma_desc_sin = clave.key.base_page;
+        r.firma_desc_con = clave.key.mip_page;
+        r.swizzle_host = clave.host_swizzle;
+        r.signos = clave.swizzled_signs;
+        r.banderas_clave = (uint32_t(clave.key.tiled) << 0) |
+                           (uint32_t(clave.key.format) << 4) |
+                           (uint32_t(clave.key.packed_mips) << 12) |
+                           (uint32_t(clave.key.mip_max_level & 7) << 13) |
+                           (uint32_t(clave.key.endianness) << 16);
+      }
+      r.es_firmado = e.is_signed ? 1 : 0;
+    }
+  }
+
+  // La identidad del monton de descriptores, para poder fechar los indices: sin esto
+  // un indice no dice a que recurso apunta, porque el monton se reutiliza.
+  void AnotaMontonDeDescriptores(ParShaders& par, uint64_t monton, uint32_t tam_descriptor) {
+    par.descriptor_heap_pixel = monton;
+    par.descriptor_buffer_pixel = tam_descriptor;
+  }
+
+  // Una huella barata de lo que define el MATERIAL de un dibujo del par: los shaders,
+  // las constantes de luz, el estado de mezcla y color, y las texturas con su huella de
+  // contenido. NO incluye los interpoladores ni el buffer de vertices, que cambian con
+  // la pose en cada fotograma: si entraran, la huella cambiaria siempre y no se veria
+  // nada. Lo que se busca es justo el cambio de material que no va acompanado de
+  // ningun cambio en el fetch constant.
+  static uint32_t HuellaDelDibujo(const SondaDibujo& d) {
+    uint32_t h = 2166136261u;
+    auto mezcla = [&h](uint32_t v) {
+      h ^= v;
+      h *= 16777619u;
+    };
+    mezcla(uint32_t(d.vs));
+    mezcla(uint32_t(d.vs >> 32));
+    mezcla(uint32_t(d.ps));
+    mezcla(uint32_t(d.ps >> 32));
+    mezcla(d.prim_anfitrion);
+    mezcla(d.c1[0]);
+    mezcla(d.c1[1]);
+    mezcla(d.c1[2]);
+    mezcla(d.c2[0]);
+    mezcla(d.c2[1]);
+    mezcla(d.c2[2]);
+    mezcla(d.c162[0]);
+    mezcla(d.c162[1]);
+    mezcla(d.c162[2]);
+    mezcla(d.c37[0]);
+    mezcla(d.color_cntl);
+    mezcla(d.blend0);
+    mezcla(d.color_mask);
+    mezcla(d.depth_cntl);
+    mezcla(d.sc_mode);
+    // surfInfo y colorInfo dicen a que destino se dibuja, no como es el material: el
+    // mismo material se usa contra muchos destinos (la pasada de piel escribe en
+    // varios), asi que si entraran la tabla se llenaria de estados que no son distintos.
+    // Se imprimen igual, para poder compararlos entre dos estados.
+    mezcla(d.has_ps);
+    mezcla(d.mata);
+    mezcla(d.escribe_color);
+    mezcla(d.escribe_prof);
+    // Las booleanas deciden la RAMA del shader de vertices, que es lo que determina que
+    // o0 lleve UV y no otra cosa. Tienen que entrar en la huella: si cambian, el dibujo
+    // es materialmente otro aunque todas las constantes de luz sean iguales.
+    for (uint32_t i = 0; i < 8; ++i) {
+      mezcla(d.bools[i]);
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      mezcla(d.bools_extra[i]);
+    }
+    for (uint32_t i = 0; i < d.tex_n && i < rex::countof(d.tex); ++i) {
+      mezcla(d.tex[i].fc);
+      mezcla(d.tex[i].base);
+      mezcla(d.tex[i].mip);
+      mezcla(d.tex[i].fmt);
+      mezcla(d.tex[i].swizzle_host);
+      mezcla(d.tex[i].signos);
+      mezcla(d.tex[i].enrt);
+    }
+    return h;
+  }
+
+  // Imprime un dibujo entero, en una linea por cosa, para poder restar dos dibujos a
+  // mano. `motivo` dice por que se imprime.
+  void ImprimeDibujo(const SondaDibujo& d, const char* motivo) {
+    REXLOG_WARN(
+        "[SONDA-1] {} VS={:016X} PS={:016X} primVisitante={} primAnfitrion={} indices={} "
+        "vertices={} mascaraVS={:X} mascaraPS={:X}",
+        motivo, d.vs, d.ps, d.prim_visitante, d.prim_anfitrion, d.indices, d.vertices,
+        d.mascara_vs, d.mascara_ps);
+    REXLOG_WARN(
+        "[SONDA-1] {} c1={:08X},{:08X},{:08X},{:08X} c2={:08X},{:08X},{:08X},{:08X} "
+        "c162={:08X},{:08X},{:08X},{:08X} c37={:08X},{:08X},{:08X},{:08X}",
+        motivo, d.c1[0], d.c1[1], d.c1[2], d.c1[3], d.c2[0], d.c2[1], d.c2[2], d.c2[3],
+        d.c162[0], d.c162[1], d.c162[2], d.c162[3], d.c37[0], d.c37[1], d.c37[2], d.c37[3]);
+    REXLOG_WARN(
+        "[SONDA-1] {} colorCntl={:08X} blend0={:08X} colorMask={:08X} depthCntl={:08X} "
+        "scMode={:08X} colorInfo={:08X} depthInfo={:08X} surfInfo={:08X} hayPS={} mata={} "
+        "escribeColor={} escribeProf={}",
+        motivo, d.color_cntl, d.blend0, d.color_mask, d.depth_cntl, d.sc_mode, d.color_info,
+        d.depth_info, d.surf_info, d.has_ps, d.mata, d.escribe_color, d.escribe_prof);
+    REXLOG_WARN(
+        "[SONDA-1] {} interp v1=({:.4f},{:.4f},{:.4f},{:.4f}) v2=({:.4f},{:.4f},{:.4f},{:.4f}) "
+        "uv=({:.4f},{:.4f},{:.4f},{:.4f})",
+        motivo, rex::memory::Reinterpret<float>(d.interp_v1[0]),
+        rex::memory::Reinterpret<float>(d.interp_v1[1]),
+        rex::memory::Reinterpret<float>(d.interp_v1[2]),
+        rex::memory::Reinterpret<float>(d.interp_v1[3]),
+        rex::memory::Reinterpret<float>(d.interp_v2[0]),
+        rex::memory::Reinterpret<float>(d.interp_v2[1]),
+        rex::memory::Reinterpret<float>(d.interp_v2[2]),
+        rex::memory::Reinterpret<float>(d.interp_v2[3]),
+        rex::memory::Reinterpret<float>(d.interp_uv[0]),
+        rex::memory::Reinterpret<float>(d.interp_uv[1]),
+        rex::memory::Reinterpret<float>(d.interp_uv[2]),
+        rex::memory::Reinterpret<float>(d.interp_uv[3]));
+    REXLOG_WARN(
+        "[SONDA-1] {} vfetch0 dir={:08X} largo={} tipo={} stride={} bytes={:08X},{:08X},"
+        "{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+        motivo, d.vfetch0_dir, d.vfetch0_largo, d.vfetch0_tipo, d.vfetch0_stride,
+        d.vfetch0_bytes[0], d.vfetch0_bytes[1], d.vfetch0_bytes[2], d.vfetch0_bytes[3],
+        d.vfetch0_bytes[4], d.vfetch0_bytes[5], d.vfetch0_bytes[6], d.vfetch0_bytes[7]);
+    REXLOG_WARN(
+        "[SONDA-1] {} bools={:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X} "
+        "bools32={:08X},{:08X},{:08X},{:08X}",
+        motivo, d.bools[0], d.bools[1], d.bools[2], d.bools[3], d.bools[4], d.bools[5],
+        d.bools[6], d.bools[7], d.bools_extra[0], d.bools_extra[1], d.bools_extra[2],
+        d.bools_extra[3]);
+    // El bloque DXT1 que se muestrea de verdad en este estado: 8 bytes crudos por
+    // textura, con el texel al que apuntan las UV. Es lo que decide el color.
+    if (d.bloque_ok) {
+      REXLOG_WARN(
+          "[SONDA-1] {} bloque fc0 texel={},{} bytes={:08X},{:08X} | fc3 texel={},{} "
+          "bytes={:08X},{:08X}",
+          motivo, d.bloque_uv0[0], d.bloque_uv0[1], d.bloque_fc0[0], d.bloque_fc0[1],
+          d.bloque_uv3[0], d.bloque_uv3[1], d.bloque_fc3[0], d.bloque_fc3[1]);
+    }
+    for (uint32_t i = 0; i < d.tex_n && i < rex::countof(d.tex); ++i) {
+      const SondaDibujo::Tex& t = d.tex[i];
+      REXLOG_WARN(
+          "[SONDA-1] {} tex fc={} base={:X} mip={:X} fmt={} wh={}x{} niveles={} swizzle={:03X} "
+          "signos={:02X} enRT={} semilla={:08X} deltaMedia={} sinSigno={} conSigno={}",
+          motivo, t.fc, t.base, t.mip, t.fmt, t.ancho, t.alto, t.niveles, t.swizzle_host,
+          t.signos, t.enrt, t.semilla, t.delta_media, t.indice_sin_signo, t.indice_con_signo);
+    }
+  }
+
+  // Rellena la ficha del dibujo y la imprime si su huella cambio respecto al dibujo
+  // anterior del mismo par. Se llama en CADA dibujo del par, no una vez por informe:
+  // el fallo que hay que cazar aparece y desaparece entre fotogramas con todos los
+  // agregados iguales, asi que el unico sitio donde se ve es el dibujo suelto.
+  void AnotaDibujo(const Shader* vs_shader, const Shader* ps_shader, const RegisterFile& regs,
+                   memory::Memory* memory, D3D12TextureCache* cache, uint32_t prim,
+                   uint32_t indices, uint32_t vertices, bool hay_ps, uint64_t vs, uint64_t ps,
+                   const PrimitiveProcessor::ProcessingResult* resultado) {
+    // Disabling reports must also stop CPU reads of GPU-written resources and
+    // vertex interpretation; otherwise the probe still forces GPU readbacks.
+    if (REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) <= 0) {
+      return;
+    }
+    ParShaders* par = nullptr;
+    for (uint32_t i = 0; i < pares_usados; ++i) {
+      if (pares[i].vs == vs && pares[i].ps == ps) {
+        par = &pares[i];
+        break;
+      }
+    }
+    if (par == nullptr) {
+      return;
+    }
+    SondaDibujo d;
+    d.vs = vs;
+    d.ps = ps;
+    d.prim_visitante = prim;
+    d.prim_anfitrion = resultado != nullptr ? uint32_t(resultado->host_primitive_type) : 0;
+    d.indices = indices;
+    d.vertices = vertices;
+    d.has_ps = hay_ps ? 1 : 0;
+    ++par->dibujos_del_par;
+    // La parte CARA (interprete + huellas de textura) solo se hace cada kCadaCaro
+    // dibujos: leer 2 KB por textura en cada dibujo serian cientos de MB/s. El estado
+    // barato se lee siempre.
+    const bool caro = (par->dibujos_del_par % kCadaCaro) == 1;
+    if (!caro) {
+      // Sin la parte cara, heredar las texturas del ultimo estado completo: si no, la
+      // huella alternaria entre "con texturas" y "sin ellas" y la tabla se llenaria de
+      // estados que no son distintos.
+      d.tex_n = par->tex_ultimas_n;
+      for (uint32_t i = 0; i < par->tex_ultimas_n && i < rex::countof(d.tex); ++i) {
+        d.tex[i] = par->tex_ultimas[i];
+      }
+      for (uint32_t i = 0; i < 4; ++i) {
+        d.interp_uv[i] = par->interp_uv_ultimo[i];
+        d.interp_v1[i] = par->interp_v1_ultimo[i];
+        d.interp_v2[i] = par->interp_v2_ultimo[i];
+      }
+    }
+    if (vs_shader != nullptr) {
+      d.mascara_vs = uint32_t(vs_shader->writes_interpolators());
+    }
+    if (ps_shader != nullptr) {
+      uint32_t param_gen = 0;
+      d.mascara_ps = ps_shader->GetInterpolatorInputMask(
+          regs.Get<reg::SQ_PROGRAM_CNTL>(), regs.Get<reg::SQ_CONTEXT_MISC>(), param_gen);
+      d.mata = ps_shader->kills_pixels() ? 1 : 0;
+      d.escribe_color = ps_shader->writes_color_targets() ? 1 : 0;
+      d.escribe_prof = ps_shader->writes_depth() ? 1 : 0;
+    }
+    // Las constantes que el shader del luchador usa para su luz, en crudo.
+    for (uint32_t i = 0; i < 4; ++i) {
+      d.c1[i] = regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1 * 4 + i];
+      d.c2[i] = regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 2 * 4 + i];
+      d.c162[i] = regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 162 * 4 + i];
+      d.c37[i] = regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 37 * 4 + i];
+    }
+    d.color_cntl = regs[XE_GPU_REG_RB_COLORCONTROL];
+    d.blend0 = regs[XE_GPU_REG_RB_BLENDCONTROL0];
+    d.color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+    d.depth_cntl = regs[XE_GPU_REG_RB_DEPTHCONTROL];
+    d.sc_mode = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+    d.color_info = regs[XE_GPU_REG_RB_COLOR_INFO];
+    d.depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO];
+    d.surf_info = regs[XE_GPU_REG_RB_SURFACE_INFO];
+    // Las constantes booleanas: el shader de vertices elige rama con ellas y cada rama
+    // calcula o0 de otra manera. Es el unico sitio del dibujo donde puede estar la
+    // diferencia entre "o0 son las UV" y "o0 es otra cosa".
+    for (uint32_t i = 0; i < 8; ++i) {
+      d.bools[i] = regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i];
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      d.bools_extra[i] = regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_032_063 + i];
+    }
+    // El buffer de vertices que el shader de vertices declara usar, con sus bytes: si
+    // la malla sale negra, aqui se ve si los datos son los mismos que en el dibujo
+    // bueno o si el juego entrego otra cosa.
+    if (vs_shader != nullptr) {
+      const Shader::ConstantRegisterMap& mapa = vs_shader->constant_register_map();
+      for (uint32_t palabra = 0; palabra < 3; ++palabra) {
+        uint32_t bits = mapa.vertex_fetch_bitmap[palabra];
+        uint32_t bit;
+        if (rex::bit_scan_forward(bits, &bit)) {
+          const uint32_t indice = palabra * 32 + bit;
+          const xenos::xe_gpu_vertex_fetch_t f = regs.GetVertexFetch(indice);
+          d.vfetch0_dir = f.address << 2;
+          d.vfetch0_largo = f.size << 2;
+          d.vfetch0_tipo = uint32_t(f.type);
+          d.vfetch0_stride = uint32_t(f.endian);
+          if (memory != nullptr) {
+            const uint8_t* p = memory->TranslatePhysical(d.vfetch0_dir);
+            if (p != nullptr) {
+              std::memcpy(d.vfetch0_bytes, p, sizeof(d.vfetch0_bytes));
+            }
+          }
+          break;
+        }
+      }
+    }
+    // La huella BARATA: shaders, constantes de luz, estado de mezcla y color. Se
+    // calcula en todos los dibujos porque no lee memoria.
+    const uint32_t huella_barata = HuellaDelDibujo(d);
+    if (caro) {
+      // Los interpoladores del dibujo y, por cada textura, una huella de su contenido
+      // AHORA: media de los bytes y un hash barato. Si la textura cambia de un dibujo
+      // al siguiente, aqui se ve; si no cambia y el cuerpo se pone negro, el fallo no
+      // esta en la textura.
+      SondaSalidaVertices salida;
+      if (vs_shader != nullptr && memory != nullptr &&
+          ShaderInterpreter::CanInterpretShader(*vs_shader)) {
+        ShaderInterpreter interprete(regs, *memory);
+        interprete.SetShader(*vs_shader);
+        interprete.SetExportSink(&salida);
+        salida.Reset();
+        interprete.temp_registers()[0] = 0.0f;
+        interprete.Execute();
+        for (uint32_t i = 0; i < 4; ++i) {
+          d.interp_uv[i] = rex::memory::Reinterpret<uint32_t>(salida.valor[0][i]);
+          d.interp_v1[i] = rex::memory::Reinterpret<uint32_t>(salida.valor[1][i]);
+          d.interp_v2[i] = rex::memory::Reinterpret<uint32_t>(salida.valor[2][i]);
+        }
+        d.interp_uv_bits[0] = salida.mascara[0];
+        d.interp_v1_bits[0] = salida.mascara[1];
+        d.interp_v1_bits[1] = salida.mascara[2];
+        interprete.SetExportSink(nullptr);
+      }
+      if (ps_shader != nullptr && cache != nullptr && memory != nullptr) {
+        const D3D12Shader& shader = static_cast<const D3D12Shader&>(*ps_shader);
+        for (const Shader::TextureBinding& enlace : shader.texture_bindings()) {
+          if (d.tex_n >= rex::countof(d.tex) || enlace.fetch_constant >= 32) {
+            continue;
+          }
+          const xenos::xe_gpu_texture_fetch_t t = regs.GetTextureFetch(enlace.fetch_constant);
+          uint32_t ancho = 0, alto = 0, base = 0, mip = 0, min_nivel = 0, max_nivel = 0;
+          texture_util::GetSubresourcesFromFetchConstant(t, &ancho, &alto, nullptr, &base, &mip,
+                                                         &min_nivel, &max_nivel);
+          SondaDibujo::Tex& tx = d.tex[d.tex_n++];
+          tx.fc = enlace.fetch_constant;
+          tx.base = base;
+          tx.mip = mip;
+          tx.fmt = uint32_t(t.format);
+          tx.ancho = ancho + 1;
+          tx.alto = alto + 1;
+          tx.niveles = max_nivel - min_nivel + 1;
+          tx.swizzle_host = cache->GetActiveTextureHostSwizzle(enlace.fetch_constant);
+          tx.signos = cache->GetActiveTextureSwizzledSigns(enlace.fetch_constant);
+          tx.enrt = EnResolucionReciente(base << 12) ? 1 : 0;
+          // El indice del descriptor que el dibujo consume de verdad, en las dos
+          // ramas que el DXBC puede elegir con el byte de signos del sistema.
+          for (const D3D12Shader::TextureBinding& sb : shader.GetTextureBindingsAfterTranslation()) {
+            if (sb.fetch_constant != enlace.fetch_constant) {
+              continue;
+            }
+            D3D12Shader::TextureBinding e_sin = sb;
+            e_sin.is_signed = false;
+            tx.indice_sin_signo = cache->GetActiveTextureBindlessSRVIndex(e_sin);
+            D3D12Shader::TextureBinding e_con = sb;
+            e_con.is_signed = true;
+            tx.indice_con_signo = cache->GetActiveTextureBindlessSRVIndex(e_con);
+            break;
+          }
+          // El bloque DXT1 que el shader muestrea con las UV de ESTE estado: tf0 usa
+          // (v0.x, v0.y) y tf3 usa (v0.z, v0.w). Se envuelven con semantica de
+          // repeticion. Son los 8 bytes que deciden el color: todo lo demas puede estar
+          // bien y el bloque ser negro.
+          if (base != 0 && uint32_t(t.format) == uint32_t(xenos::TextureFormat::k_DXT1) &&
+              enlace.fetch_constant <= 3) {
+            const bool es_fc3 = enlace.fetch_constant == 3;
+            const float u = rex::memory::Reinterpret<float>(d.interp_uv[es_fc3 ? 2 : 0]);
+            const float v = rex::memory::Reinterpret<float>(d.interp_uv[es_fc3 ? 3 : 1]);
+            const uint32_t w = ancho + 1, h = alto + 1;
+            const float uu = u - std::floor(u);
+            const float vv = v - std::floor(v);
+            const uint32_t texel_x = std::min(uint32_t(uu * float(w)), w - 1);
+            const uint32_t texel_y = std::min(uint32_t(vv * float(h)), h - 1);
+            const uint32_t bloque = (texel_y / 4) * (w / 4) + (texel_x / 4);
+            const uint8_t* pb = memory->TranslatePhysical((base << 12) + bloque * 8);
+            if (pb != nullptr) {
+              std::memcpy(es_fc3 ? d.bloque_fc3 : d.bloque_fc0, pb, 8);
+              uint32_t* destino_uv = es_fc3 ? d.bloque_uv3 : d.bloque_uv0;
+              destino_uv[0] = texel_x;
+              destino_uv[1] = texel_y;
+              d.bloque_ok = 1;
+            }
+          }
+          const uint8_t* p = base != 0 ? memory->TranslatePhysical(base << 12) : nullptr;
+          if (p != nullptr) {
+            uint32_t suma = 0, semilla = 2166136261u;
+            for (uint32_t i = 0; i < kBytesHuella; ++i) {
+              suma += p[i];
+              semilla ^= p[i];
+              semilla *= 16777619u;
+            }
+            tx.semilla = semilla;
+            tx.delta_media = int32_t(suma / kBytesHuella);
+          }
+        }
+      }
+    }
+    // Un ESTADO DE MATERIAL, no un dibujo: se busca en la tabla el que coincide en
+    // todo lo que define el material; si no esta, se anade; si esta, solo se cuenta.
+    // Asi el log no crece con los fotogramas y la tabla se puede comparar entera
+    // entre dos peleas.
+    const uint32_t huella = HuellaDelDibujo(d);
+    if (caro) {
+      par->tex_ultimas_n = d.tex_n;
+      for (uint32_t i = 0; i < d.tex_n && i < rex::countof(par->tex_ultimas); ++i) {
+        par->tex_ultimas[i] = d.tex[i];
+      }
+      // Y el seguimiento del contenido, que es lo que cambia cuando el cuerpo se pone
+      // negro: media de los primeros bytes, huellas distintas y la hora del minimo.
+      for (uint32_t i = 0; i < d.tex_n && i < rex::countof(d.tex); ++i) {
+        const SondaDibujo::Tex& t = d.tex[i];
+        if (t.base == 0 || t.semilla == 0) {
+          continue;
+        }
+        uint32_t hueco = par->seguimiento_usado;
+        for (uint32_t j = 0; j < par->seguimiento_usado; ++j) {
+          if (par->seguimiento[j].base == t.base && par->seguimiento[j].fc == t.fc) {
+            hueco = j;
+            break;
+          }
+        }
+        if (hueco >= rex::countof(par->seguimiento)) {
+          continue;
+        }
+        ParShaders::SeguimientoTex& s = par->seguimiento[hueco];
+        if (hueco == par->seguimiento_usado) {
+          s = ParShaders::SeguimientoTex{};
+          s.base = t.base;
+          s.fc = t.fc;
+          ++par->seguimiento_usado;
+        }
+        ++s.usada;
+        if (t.semilla != s.huella_ultima) {
+          s.huella_ultima = t.semilla;
+          ++s.huellas;
+        }
+        if (t.delta_media < int32_t(s.media_min)) {
+          s.media_min = uint32_t(t.delta_media);
+          MarcaHora(s.hora_min, sizeof(s.hora_min));
+        }
+        if (uint32_t(t.delta_media) > s.media_max) {
+          s.media_max = uint32_t(t.delta_media);
+        }
+        s.media_ultima = uint32_t(t.delta_media);
+      }
+      for (uint32_t i = 0; i < 4; ++i) {
+        par->interp_uv_ultimo[i] = d.interp_uv[i];
+        par->interp_v1_ultimo[i] = d.interp_v1[i];
+        par->interp_v2_ultimo[i] = d.interp_v2[i];
+      }
+    }
+    for (uint32_t i = 0; i < par->estados_usados; ++i) {
+      if (par->estados[i].huella_barata == huella) {
+        ++par->estados[i].veces;
+        MarcaHora(par->estados[i].ultima, sizeof(par->estados[i].ultima));
+        return;
+      }
+    }
+    if (par->estados_usados < rex::countof(par->estados)) {
+      d.veces = 1;
+      MarcaHora(d.primera, sizeof(d.primera));
+      std::memcpy(d.ultima, d.primera, sizeof(d.ultima));
+      d.huella_barata = huella;
+      par->estados[par->estados_usados++] = d;
+    } else {
+      ++par->estados_saturados;
+    }
+  }
+
+  static void MarcaHora(char* destino, size_t tamano) {
+    const auto ahora = std::chrono::system_clock::now();
+    const std::time_t segundos = std::chrono::system_clock::to_time_t(ahora);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &segundos);
+#else
+    localtime_r(&segundos, &tm);
+#endif
+    std::snprintf(destino, tamano, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+  }
+
+  void VolcarTextura(uint32_t base_bytes, const uint8_t* origen, uint32_t bytes,
+                     const xenos::xe_gpu_texture_fetch_t& t, uint32_t ancho, uint32_t alto,
+                     uint32_t row_pitch_bytes = 0) {
+    static std::vector<uint32_t> volcadas;
+    if (origen == nullptr || bytes == 0) {
+      return;
+    }
+    for (uint32_t b : volcadas) {
+      if (b == base_bytes) {
+        return;
+      }
+    }
+    if (bytes > (32u << 20)) {
+      // Un volcado gigante no se salta para siempre: se recuerda solo el tamano, no
+      // la direccion, para que el proximo intento con una pagina mas pequena si se
+      // guarde.
+      return;
+    }
+    volcadas.push_back(base_bytes);
+
+    std::vector<uint8_t> gpu(origen, origen + bytes);
+    switch (t.endianness) {
+      case xenos::Endian::k8in16:
+        for (uint32_t i = 0; i + 1 < bytes; i += 2) {
+          std::swap(gpu[i], gpu[i + 1]);
+        }
+        break;
+      case xenos::Endian::k8in32:
+        for (uint32_t i = 0; i + 3 < bytes; i += 4) {
+          std::swap(gpu[i], gpu[i + 3]);
+          std::swap(gpu[i + 1], gpu[i + 2]);
+        }
+        break;
+      case xenos::Endian::k16in32:
+        for (uint32_t i = 0; i + 3 < bytes; i += 4) {
+          std::swap(gpu[i], gpu[i + 2]);
+          std::swap(gpu[i + 1], gpu[i + 3]);
+        }
+        break;
+      default:
+        break;
+    }
+
+    const uint32_t cuatro_cc = t.format == xenos::TextureFormat::k_DXT1    ? 0x31545844u  // "DXT1"
+                               : t.format == xenos::TextureFormat::k_DXT2_3 ? 0x33545844u  // "DXT3"
+                               : t.format == xenos::TextureFormat::k_DXT4_5 ? 0x35545844u  // "DXT5"
+                                                                            : 0u;
+    uint32_t cabecera[32] = {};
+    cabecera[0] = 0x20534444u;  // "DDS "
+    cabecera[1] = 124;          // tamano de la cabecera
+    cabecera[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;  // alto, ancho, pitch, pixelformat, linearsize
+    cabecera[3] = alto;
+    cabecera[4] = ancho;
+    cabecera[5] = bytes;
+    cabecera[8] = 1;  // mipmapCount
+    cabecera[19] = 32; // tamano de DDS_PIXELFORMAT
+    cabecera[20] = cuatro_cc ? 0x4u : 0x40u;  // DDPF_FOURCC / DDPF_RGB
+    cabecera[21] = cuatro_cc;
+    if (!cuatro_cc) {
+      cabecera[22] = 32;
+      cabecera[23] = 0x00FF0000u;
+      cabecera[24] = 0x0000FF00u;
+      cabecera[25] = 0x000000FFu;
+      cabecera[26] = 0xFF000000u;
+    }
+    cabecera[27] = 0x1000;  // DDSCAPS_TEXTURE
+
+    char nombre[160];
+    std::snprintf(nombre, sizeof(nombre), "capturas/tex_%08X_%ux%u_f%u_t%u_fila%u.dds",
+                  base_bytes, ancho, alto, uint32_t(t.format), uint32_t(t.tiled),
+                  row_pitch_bytes);
+    std::ofstream salida(nombre, std::ios::binary);
+    if (salida) {
+      salida.write(reinterpret_cast<const char*>(cabecera), sizeof(cabecera));
+      salida.write(reinterpret_cast<const char*>(gpu.data()), bytes);
+      salida.close();
+    }
+
+    if (t.endianness != xenos::Endian::kNone) {
+      char nombre_crudo[176];
+      std::snprintf(nombre_crudo, sizeof(nombre_crudo),
+                    "capturas/tex_%08X_%ux%u_f%u_t%u_fila%u_crudo.dds", base_bytes, ancho, alto,
+                    uint32_t(t.format), uint32_t(t.tiled), row_pitch_bytes);
+      std::ofstream salida_crudo(nombre_crudo, std::ios::binary);
+      if (salida_crudo) {
+        salida_crudo.write(reinterpret_cast<const char*>(cabecera), sizeof(cabecera));
+        salida_crudo.write(reinterpret_cast<const char*>(origen), bytes);
+      }
+    }
+  }
+
+  // Un buffer de vertices que el shader usa y que cae dentro de un flujo
+  // memexport reciente: la malla del luchador sale de memoria que la GPU acaba
+  // de escribir, asi que un fallo ahi no se ve ni en los fetch ni en las
+  // texturas.
+  void AnotaVfetchEnExport(const xenos::xe_gpu_vertex_fetch_t& f) {
+    if (REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) <= 0) {
+      return;
+    }
+    ++vfetch_total;
+    const uint32_t inicio = uint32_t(f.address) << 2;
+    const uint32_t fin = inicio + (f.size << 2);
+    for (const draw_util::MemExportRange& rango : me_recientes) {
+      const uint32_t rango_inicio = rango.base_address_dwords << 2;
+      if (inicio < rango_inicio + rango.size_bytes && fin > rango_inicio) {
+        ++vfetch_en_export;
+        vfetch_export_dir = inicio;
+        vfetch_export_largo = f.size << 2;
+        vfetch_export_rango = rango_inicio;
+        vfetch_export_rango_largo = rango.size_bytes;
+        return;
+      }
+    }
+  }
+
+  void AnotaCopia(uint32_t destino, uint32_t longitud) {
+    if (REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) <= 0) {
+      return;
+    }
+    copia_destino = destino;
+    copia_longitud = longitud;
+    ++copia_repeticiones;
+    if (swap_ptr != 0 && destino == swap_ptr) {
+      ++copias_frente;
+    }
+    // Todas las resoluciones de render target vistas en la sesion, para poder
+    // decir si una textura que el shader muestrea salio de un render target (la
+    // piel y los tatuajes de un luchador creado por el jugador se componen en
+    // tiempo de ejecucion) o lleva en memoria desde que se cargo el nivel. No se
+    // limita a las ultimas: una textura de luchador se cuece una vez al crearlo
+    // y puede muestrearse minutos despues.
+    copias_recientes.insert(destino);
+  }
+
+  // Si la direccion fisica es el principio de una resolucion de render target
+  // vista en esta sesion. Se compara contra el principio y no contra el rango
+  // entero porque el tamano que la sonda anota no siempre es el de la textura.
+  bool EnResolucionReciente(uint32_t direccion_bytes) const {
+    return copias_recientes.find(direccion_bytes) != copias_recientes.end();
+  }
+
+  // Ejecuta el shader de vertices en el interprete para varios indices de vertice
+  // y guarda lo que escribe en los interpoladores. El interprete lee el mismo
+  // fichero de registros y la misma memoria que el shader real, asi que lo que
+  // salga de aqui es lo que el shader de pixeles recibe como v0, v1 y v2.
+  //
+  // Se recorren VARIOS indices y no solo el cero porque el color de vertice que
+  // el shader de pixeles multiplica por la textura sale de un atributo del
+  // buffer de vertices: con un solo vertice no se puede saber si todos traen el
+  // mismo color o si unos traen color y otros cero, y esa diferencia es
+  // exactamente la que separa al luchador que se ve bien del que sale negro.
+  void SondaSalidaDelShaderDeVertices(const Shader& vs, const RegisterFile& regs,
+                                      memory::Memory* memory, ParShaders& par) {
+    if (memory == nullptr || !ShaderInterpreter::CanInterpretShader(vs)) {
+      return;
+    }
+    ShaderInterpreter interprete(regs, *memory);
+    interprete.SetShader(vs);
+    SondaSalidaVertices salida;
+    interprete.SetExportSink(&salida);
+    static constexpr uint32_t kVertices = 16;
+    float minimo[3][4], maximo[3][4];
+    double suma[3][4] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+      for (uint32_t j = 0; j < 4; ++j) {
+        minimo[i][j] = 1e30f;
+        maximo[i][j] = -1e30f;
+      }
+    }
+    uint32_t leidos = 0;
+    for (uint32_t indice = 0; indice < kVertices; ++indice) {
+      salida.Reset();
+      interprete.temp_registers()[0] = float(indice);
+      interprete.Execute();
+      if (!salida.interpolador[0]) {
+        continue;
+      }
+      ++leidos;
+      for (uint32_t i = 0; i < 3; ++i) {
+        if (!salida.interpolador[i]) {
+          continue;
+        }
+        for (uint32_t j = 0; j < 4; ++j) {
+          const float v = salida.valor[i][j];
+          minimo[i][j] = std::min(minimo[i][j], v);
+          maximo[i][j] = std::max(maximo[i][j], v);
+          suma[i][j] += v;
+        }
+      }
+      if (indice == 0) {
+        for (uint32_t i = 0; i < 3; ++i) {
+          par.vs_salida_mascara[i] = salida.mascara[i];
+          for (uint32_t j = 0; j < 4; ++j) {
+            par.vs_salida[i][j] = rex::memory::Reinterpret<uint32_t>(salida.valor[i][j]);
+          }
+          if (salida.interpolador[i]) {
+            par.vs_salida_leida |= 1u << i;
+          }
+        }
+      }
+    }
+    if (leidos != 0) {
+      par.v1_leidos = leidos;
+      for (uint32_t i = 0; i < 3; ++i) {
+        for (uint32_t j = 0; j < 4; ++j) {
+          par.interp_min[i][j] = minimo[i][j];
+          par.interp_max[i][j] = maximo[i][j];
+          par.interp_media[i][j] = float(suma[i][j] / leidos);
+        }
+      }
+    }
+    interprete.SetExportSink(nullptr);
+  }
+
+  // Censo de las texturas que el shader de pixeles muestrea, con la misma
+  // informacion que usa la cache para decidir si la textura existe. Se llama en
+  // cada dibujo del par y acumula por DIRECCION BASE, no por indice de fetch
+  // constant: el juego reengancha el mismo fetch constant a una textura distinta
+  // para cada luchador, asi que indexar por el indice funde en una sola entrada
+  // la piel que sale bien y la que sale mal y esconde justo la diferencia que
+  // hay que ver.
+  void AnotaTexturas(ParShaders& par, const Shader* ps_shader, const RegisterFile& regs,
+                     memory::Memory* memory, const TextureCache* cache) {
+    if (ps_shader == nullptr) {
+      return;
+    }
+    for (const Shader::TextureBinding& enlace : ps_shader->texture_bindings()) {
+      if (enlace.fetch_constant >= 32) {
+        continue;
+      }
+      const xenos::xe_gpu_texture_fetch_t t = regs.GetTextureFetch(enlace.fetch_constant);
+      uint32_t ancho = 0, alto = 0, prof = 0, pagina_base = 0, pagina_mip = 0;
+      uint32_t mip_min = 0, mip_max = 0;
+      texture_util::GetSubresourcesFromFetchConstant(t, &ancho, &alto, &prof, &pagina_base,
+                                                     &pagina_mip, &mip_min, &mip_max);
+      uint32_t hueco = kTexMax;
+      for (uint32_t i = 0; i < par.tex_huecos; ++i) {
+        if (par.tex_base[i] == pagina_base && par.tex_mip[i] == pagina_mip &&
+            par.tex_wh[i][0] == ancho + 1 && par.tex_wh[i][1] == alto + 1 &&
+            par.tex_fmt[i] == uint32_t(t.format) && par.tex_tiled[i] == uint32_t(t.tiled) &&
+            par.tex_endian[i] == uint32_t(t.endianness)) {
+          hueco = i;
+          break;
+        }
+      }
+      if (hueco == kTexMax) {
+        ++par.tex_usadas;
+        if (t.type != xenos::FetchConstantType::kTexture) {
+          ++par.tex_malas;
+        }
+        if (pagina_base == 0 && pagina_mip == 0) {
+          ++par.tex_sin_pagina;
+        }
+        if (par.tex_huecos >= kTexMax) {
+          continue;
+        }
+        hueco = par.tex_huecos++;
+        par.tex_fc[hueco] = enlace.fetch_constant;
+        par.tex_tipo[hueco] = uint32_t(t.type);
+        par.tex_base[hueco] = pagina_base;
+        par.tex_mip[hueco] = pagina_mip;
+        par.tex_fmt[hueco] = uint32_t(t.format);
+        par.tex_wh[hueco][0] = ancho + 1;
+        par.tex_wh[hueco][1] = alto + 1;
+        par.tex_dw[hueco][0] = t.dword_0;
+        par.tex_dw[hueco][1] = t.dword_1;
+        par.tex_dw[hueco][2] = t.dword_2;
+        par.tex_dw[hueco][3] = t.dword_3;
+        par.tex_dw[hueco][4] = t.dword_4;
+        par.tex_dw[hueco][5] = t.dword_5;
+        // El endian con el que se carga la textura. Si la clave dice "hay que
+        // canjear los bytes" y los datos ya vienen canjeados (o al reves), el
+        // muestreo devuelve ruido o un valor apagado sin que falle nada.
+        par.tex_endian[hueco] = uint32_t(t.endianness);
+        par.tex_tiled[hueco] = uint32_t(t.tiled);
+        par.tex_exp_adjust[hueco] = uint32_t(int32_t(t.exp_adjust) & 0x3F);
+        par.tex_num_format[hueco] = uint32_t(t.num_format);
+        par.tex_en_rt[hueco] = EnResolucionReciente(pagina_base << 12) ? 1 : 0;
+        if (pagina_base != 0 && memory != nullptr) {
+          const uint8_t* origen = memory->TranslatePhysical(pagina_base << 12);
+          if (origen != nullptr) {
+            std::memcpy(par.tex_bytes[hueco], origen, 32);
+            par.tex_bytes_leidos[hueco] = 8;
+            // Cuanta parte de la textura son ceros y cuantos valores distintos
+            // tiene. Una textura cargada trae bytes variados; una que nunca se
+            // subio es casi toda ceros, y muestrearla da negro sin que ningun
+            // contador de enlaces se queje. Se mira solo el primer nivel y como
+            // mucho 1 MB, y solo si cae dentro de la memoria fisica mapeada.
+            const FormatInfo& fi = *FormatInfo::Get(xenos::TextureFormat(t.format));
+            const uint32_t base_bytes = pagina_base << 12;
+            // El tamano REAL en memoria del invitado: la misma cuenta que hace la
+            // cache para pedir los rangos residentes. La fila va alineada a 256
+            // bytes en las lineales, asi que "ancho*alto*bpp/8" se queda corto y el
+            // volcado perdia la parte de abajo. La fila va en el nombre del fichero
+            // para que un volcado corto se vea a simple vista.
+            uint32_t fila = 0;
+            uint32_t bytes_totales = BytesDelNivelBase(t, ancho + 1, alto + 1, &fila);
+            uint32_t bytes = bytes_totales;
+            if (bytes > (1u << 20)) {
+              bytes = 1u << 20;
+            }
+            if (bytes != 0 && base_bytes + bytes <= 0x20000000u) {
+              uint32_t ceros = 0;
+              bool cubo[4] = {};
+              for (uint32_t i = 0; i < bytes; ++i) {
+                const uint8_t v = origen[i];
+                if (v == 0) {
+                  ++ceros;
+                }
+                cubo[v >> 6] = true;
+              }
+              par.tex_ceros[hueco] = ceros * 100 / bytes;
+              par.tex_varios[hueco] =
+                  (cubo[0] ? 1 : 0) + (cubo[1] ? 1 : 0) + (cubo[2] ? 1 : 0) + (cubo[3] ? 1 : 0);
+              par.tex_bytes_vistos[hueco] = bytes;
+              // Y la textura entera a disco, para poder mirarla: si el invitado
+              // tiene una textura de verdad, el fallo esta en la carga al host;
+              // si son datos sin sentido, el juego nunca la subio. Una vez por
+              // direccion base, para no llenar el disco.
+              if (base_bytes + bytes_totales <= 0x20000000u) {
+                VolcarTextura(base_bytes, origen, bytes_totales, t, ancho + 1, alto + 1, fila);
+              }
+            }
+          }
+        }
+      }
+      if (hueco < kTexMax) {
+        ++par.tex_dibujos[hueco];
+        // Lo que la cache de texturas decidio DESPUES de pedirla. Si el enlace
+        // no es valido, "GetActiveTextureHostSwizzle" devuelve
+        // XE_GPU_TEXTURE_SWIZZLE_0000 (0), y el descriptor acaba siendo el "SRV
+        // nulo" con FORCE_VALUE_0: el muestreo da (0,0,0,0), que es negro si el
+        // color se multiplica por el y transparente si el alfa sale de ahi. Una
+        // textura normal devuelve XYZW = 0x688.
+        if (cache != nullptr) {
+          par.tex_swizzle[hueco] = cache->GetActiveTextureHostSwizzle(enlace.fetch_constant);
+          par.tex_enlace[hueco] = par.tex_swizzle[hueco] != 0 ? 1 : 0;
+          par.tex_signos[hueco] = cache->GetActiveTextureSwizzledSigns(enlace.fetch_constant);
+        }
+      }
+    }
+  }
+
+  void AnotaPar(uint64_t vs, uint64_t ps, uint64_t verts, const RegisterFile& regs,
+                memory::Memory* memory, uint32_t prim, uint32_t indices,
+                const Shader* vs_shader = nullptr, const Shader* ps_shader = nullptr,
+                const TextureCache* cache = nullptr, uint32_t ancho_vista = 0,
+                uint32_t alto_vista = 0, uint32_t muestras = 0,
+                const D3D12TextureCache* cache_d3d12 = nullptr,
+                const std::vector<D3D12TextureCache::TextureSRVKey>* claves_pixel = nullptr,
+                uint64_t monton = 0, uint32_t tam_descriptor = 0) {
+    if (REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) <= 0) {
+      return;
+    }
+    // Temporary per-draw-class capture from this UFC build's material census.
+    if (IsDiagnosticMaterial(ps) &&
+        REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) > 0) {
+      static std::set<std::array<uint32_t, 3>> captured_draws;
+      const uint32_t base = uint32_t(regs.GetTextureFetch(0).base_address) << 12;
+      if (base && captured_draws.size() < 64 &&
+          captured_draws.insert({base, uint32_t(verts), indices}).second) {
+        for (uint32_t index : {139u, 143u, 155u, 156u, 158u, 162u, 170u, 183u, 190u, 195u,
+                               213u, 220u, 228u, 254u}) {
+          const uint32_t offset = XE_GPU_REG_SHADER_CONSTANT_000_X + 1024 + index * 4;
+          REXLOG_WARN("[GPU-material] VS={:016X} PS={:016X} base={:08X} vertices={} indices={} c{}={:08X},{:08X},{:08X},{:08X}",
+                      vs, ps, base, verts, indices, index, regs[offset], regs[offset + 1],
+                      regs[offset + 2], regs[offset + 3]);
+        }
+        const std::string path = fmt::format("capturas/gpu_material_{:08X}_{:016X}_v{}_i{}.bin",
+                                              base, ps, verts, indices);
+        if (FILE* file = std::fopen(path.c_str(), "wb")) {
+          std::fwrite(regs.values, sizeof(uint32_t), RegisterFile::kRegisterCount, file);
+          std::fclose(file);
+        }
+      }
+    }
+    for (uint32_t i = 0; i < pares_usados; ++i) {
+      if (pares[i].vs == vs && pares[i].ps == ps) {
+        ++pares[i].dibujos;
+        pares[i].vertices += verts;
+        AnotaTexturas(pares[i], ps_shader, regs, memory, cache);
+        AnotaMuestreadores(pares[i], ps_shader, regs, cache_d3d12);
+        AnotaEnlacesReales(pares[i], ps_shader, regs, const_cast<D3D12TextureCache*>(cache_d3d12),
+                           claves_pixel, monton, tam_descriptor);
+        return;
+      }
+    }
+    if (pares_usados < kParesMax) {
+      ParShaders& par = pares[pares_usados];
+      par = ParShaders{};  // sin restos del informe anterior
+      par.vs = vs;
+      par.ps = ps;
+      par.dibujos = 1;
+      par.vertices = verts;
+      par.ancho_vista = ancho_vista;
+      par.alto_vista = alto_vista;
+      par.muestras = muestras;
+      // Lo que el analisis del microcodigo dice de estos dos shaders. Si el de
+      // pixeles no escribe ningun canal de color, el dibujo se cuenta igual pero
+      // no pinta nada: es la diferencia entre "se dibujo mal" y "no se pinto".
+      if (ps_shader != nullptr) {
+        par.ps_escribe_color = ps_shader->writes_color_targets();
+        par.ps_escribe_prof = ps_shader->writes_depth() ? 1 : 0;
+        par.ps_mata_pixeles = ps_shader->kills_pixels() ? 1 : 0;
+        par.ps_exporta = ps_shader->memexport_eM_written();
+      }
+      if (vs_shader != nullptr) {
+        par.vs_exporta = vs_shader->memexport_eM_written();
+      }
+      par.color_control = regs[XE_GPU_REG_RB_COLORCONTROL];
+      draw_util::Scissor scissor;
+      draw_util::GetScissor(regs, scissor, false);
+      par.recorte[0] = scissor.offset[0];
+      par.recorte[1] = scissor.offset[1];
+      par.recorte[2] = scissor.offset[0] + scissor.extent[0];
+      par.recorte[3] = scissor.offset[1] + scissor.extent[1];
+      draw_util::ViewportInfo viewport;
+      draw_util::GetHostViewportInfo(regs, 1, 1, false, 8192, 8192, true,
+                                     draw_util::GetNormalizedDepthControl(regs), false, false,
+                                     false, viewport);
+      par.vista[0] = viewport.xy_extent[0];
+      par.vista[1] = viewport.xy_extent[1];
+      par.color_info = regs[XE_GPU_REG_RB_COLOR_INFO];
+      par.depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO];
+      par.surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO];
+      par.modecontrol = regs[XE_GPU_REG_RB_MODECONTROL];
+      par.color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+      par.blend0 = regs[XE_GPU_REG_RB_BLENDCONTROL0];
+      par.sc_mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+      par.clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+      par.depth_control = regs[XE_GPU_REG_RB_DEPTHCONTROL];
+      par.stencil_ref_mask = regs[XE_GPU_REG_RB_STENCILREFMASK];
+      par.vte_cntl = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
+      par.vport_zscale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE);
+      par.vport_zoffset = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET);
+      // Las constantes flotantes viven directamente en el fichero de registros.
+      // Si la matriz de transformacion esta a cero, todos los vertices caen al
+      // origen y la escena sale negra (es la hipotesis de xenia-canary #1093).
+      for (uint32_t i = 0; i < 4; ++i) {
+        par.vs_c0[i] = regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i];
+      }
+      for (uint32_t i = 0; i < 256; ++i) {
+        par.vs_const_no_cero += regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i] != 0 ? 1 : 0;
+        par.ps_const_no_cero += regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1024 + i] != 0 ? 1 : 0;
+      }
+      // Cuantas constantes cree el analisis del microcodigo que usa el shader, y
+      // si hay direccionamiento dinamico (c[74+a0], el esqueleto del luchador).
+      // Con direccionamiento dinamico se suben las 256 y no se empaqueta; sin el,
+      // solo se suben las marcadas y el orden pasa a importar.
+      if (vs_shader != nullptr) {
+        const Shader::ConstantRegisterMap& mapa_vs = vs_shader->constant_register_map();
+        par.vs_mapa[0] = mapa_vs.float_count;
+        par.vs_mapa[1] = mapa_vs.float_dynamic_addressing ? 1 : 0;
+      }
+      if (ps_shader != nullptr) {
+        const Shader::ConstantRegisterMap& mapa_ps = ps_shader->constant_register_map();
+        par.ps_mapa[0] = mapa_ps.float_count;
+        par.ps_mapa[1] = mapa_ps.float_dynamic_addressing ? 1 : 0;
+      }
+      // Las constantes que el desensamblado del shader de pixeles nombra: c195,
+      // c242, c243, c254 y c255. c254 vale 1.0 en la convencion de la consola y
+      // el sombreado depende de ello; si llega a cero, el alfa sale cero y el
+      // luchador se vuelve transparente, y el color se apaga.
+      {
+        static constexpr uint32_t kIndicesPs[5] = {195, 242, 243, 254, 255};
+        for (uint32_t n = 0; n < 5; ++n) {
+          const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_000_X + 1024 + kIndicesPs[n] * 4;
+          for (uint32_t i = 0; i < 4; ++i) {
+            par.ps_c[n][i] = regs[base + i];
+          }
+        }
+        par.ps_c_usadas = 5;
+      }
+      // Y la primera matriz de hueso del shader de vertices.
+      for (uint32_t n = 0; n < 4; ++n) {
+        const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_000_X + (74 + n) * 4;
+        for (uint32_t i = 0; i < 4; ++i) {
+          par.vs_c74[n][i] = regs[base + i];
+        }
+      }
+      // Que constantes del banco de vertices son cero. Un nibble hexadecimal
+      // por cada cuatro constantes: bit puesto = la constante NO es cero.
+      {
+        static const char* kHex = "0123456789ABCDEF";
+        for (uint32_t n = 0; n < 256; n += 4) {
+          uint32_t nibble = 0;
+          for (uint32_t j = 0; j < 4; ++j) {
+            const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_000_X + (n + j) * 4;
+            if (regs[base] != 0 || regs[base + 1] != 0 || regs[base + 2] != 0 ||
+                regs[base + 3] != 0) {
+              nibble |= 1u << j;
+            }
+          }
+          par.vs_mapa_ceros[n >> 2] = kHex[nibble];
+        }
+      }
+      for (uint32_t n = 0; n < 15; ++n) {
+        const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_000_X + kIndicesVs[n] * 4;
+        for (uint32_t i = 0; i < 4; ++i) {
+          par.vs_c[n][i] = regs[base + i];
+        }
+      }
+      // El fetch de vertice crudo y el formato del destino de color.
+      if (par.vfetch_leidos != 0) {
+        const xenos::xe_gpu_vertex_fetch_t f = regs.GetVertexFetch(par.vfetch[0][0]);
+        par.vs_vfetch_dw[0] = f.dword_0;
+        par.vs_vfetch_dw[1] = f.dword_1;
+      }
+      par.color_info0 = regs[XE_GPU_REG_RB_COLOR_INFO];
+      par.color_mask0 = regs[XE_GPU_REG_RB_COLOR_MASK];
+      if (vs_shader != nullptr) {
+        SondaSalidaDelShaderDeVertices(*vs_shader, regs, memory, par);
+      }
+      par.prim = prim;
+      par.indices = indices;
+      // Los fetch de vertice que el shader DECLARA usar, no los primeros que
+      // esten puestos: el juego deja muchos sin usar y mirar esos es un espejismo
+      // (ya costo una conclusion falsa). Se leen del mapa de constantes del
+      // propio shader.
+      if (vs_shader != nullptr) {
+        const Shader::ConstantRegisterMap& mapa = vs_shader->constant_register_map();
+        uint32_t n = 0;
+        for (uint32_t palabra = 0; palabra < 3 && n < 6; ++palabra) {
+          uint32_t bits = mapa.vertex_fetch_bitmap[palabra];
+          uint32_t bit;
+          while (rex::bit_scan_forward(bits, &bit)) {
+            bits &= ~(uint32_t(1) << bit);
+            if (n >= 6) {
+              break;
+            }
+            const uint32_t indice = palabra * 32 + bit;
+            xenos::xe_gpu_vertex_fetch_t f = regs.GetVertexFetch(indice);
+            par.vfetch[n][0] = indice;
+            par.vfetch[n][1] = f.address;
+            par.vfetch[n][2] = f.size;
+            par.vfetch_tipo[n] = uint32_t(f.type);
+            ++n;
+          }
+        }
+        par.vfetch_leidos = n;
+      }
+      // Y los primeros dwords del primero que el shader usa, para ver si son
+      // posiciones de verdad o basura (un vertice de 0,0,0,1 hace desaparecer la
+      // malla).
+      if (par.vfetch[0][2] != 0 && par.vfetch[0][1] != 0 && memory != nullptr) {
+        const uint32_t dwords = par.vfetch[0][2] < 32 ? par.vfetch[0][2] : 32;
+        const uint8_t* origen = memory->TranslatePhysical(uint32_t(par.vfetch[0][1]) << 2);
+        if (origen != nullptr) {
+          std::memcpy(par.vfetch_bytes, origen, dwords * 4);
+          par.vfetch_bytes_leidos = dwords;
+        }
+      }
+      ++pares_usados;
+    }
+  }
+  // El formato que mas se uso en el intervalo, para saber a que se esta pintando.
+  static void Top(const uint64_t* cuenta, char* salida, size_t tam) {
+    uint32_t mejor = 0;
+    for (uint32_t i = 1; i < 96; ++i) {
+      if (cuenta[i] > cuenta[mejor]) {
+        mejor = i;
+      }
+    }
+    std::snprintf(salida, tam, "%02X x%llu", mejor, static_cast<unsigned long long>(cuenta[mejor]));
+  }
+
+  void Informe(memory::Memory* memory, uint32_t signos_sistema_0, uint32_t signos_sistema_1) {
+    const int32_t cada_s = REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos);
+    if (cada_s <= 0) {
+      return;
+    }
+    const auto ahora = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(ahora - ultimo).count() < cada_s) {
+      return;
+    }
+    ultimo = ahora;
+    char rt_mas[32], prof_mas[32];
+    Top(fmt_color, rt_mas, sizeof(rt_mas));
+    Top(fmt_prof, prof_mas, sizeof(prof_mas));
+    // Estado del monton fisico del invitado: la sospecha (xenia-canary #1093) es
+    // que el juego lo llena y luego no cabe un bloque contiguo lo bastante
+    // grande. "heapMayor" es lo que decide eso, no "heapLibre".
+    uint32_t heap_libre = 0, heap_mayor = 0, heap_total = 0;
+    if (memory) {
+      if (memory::BaseHeap* fisico = memory->LookupHeapByType(true, 0x1000)) {
+        heap_libre = fisico->GetUnreservedPageCount();
+        heap_mayor = fisico->GetLargestUnreservedSpanPages();
+        heap_total = fisico->GetTotalPageCount();
+      }
+    }
+    REXLOG_WARN(
+        "[SONDA] dibujos={} pintados={} vertices={} swaps={} copias={} sinRT={} | sinVS={} "
+        "pitch0={} sinRaster={} sinVertices={} pipelineFallido={} asyncPendiente={} "
+        "bindingsFallido={} sinPS={} memexport={} | vfetchInvalido={} vfetchSinRango={} | "
+        "RTmas={} profmas={} | heapLibre={}p "
+        "heapMayor={}p heapTotal={}p | ultimoVS={:016X} ultimoPS={:016X}",
+        total, pintados, vertices, swaps, copias, sin_rt, sin_vs, pitch0, sin_raster, sin_vertices,
+        pipeline_fallido, async_pendiente, bindings_fallido, sin_ps, memexport, vfetch_invalido,
+        vfetch_sin_rango, rt_mas, prof_mas,
+        heap_libre, heap_mayor, heap_total, ultimo_vs, ultimo_ps);
+    REXLOG_WARN(
+        "[SONDA-copia] resoluciones={} alFrente={} ultimoDestino={:08X} ultimoLargo={} | swaps={} "
+        "swapPtr={:08X} swap={}x{}",
+        copia_repeticiones, copias_frente, copia_destino, copia_longitud, swaps, swap_ptr,
+        swap_ancho, swap_alto);
+    REXLOG_WARN(
+        "[SONDA-memexport] dibujosConMemexport={} rangos={} bytes={} | "
+        "primerFlujoBase={:08X} primerFlujoLargo={} mayor={} en={:08X}",
+        memexport, memexport_rangos, memexport_bytes, me_primer_base, me_primer_largo, me_rango_max,
+        me_rango_max_base);
+    REXLOG_WARN(
+        "[SONDA-flujo] shaders={} sinConstantes={} rechazadas={} aceptadas={} | "
+        "ultimoVertice={} eM={:02X} rechazada={} dwords={:08X},{:08X},{:08X},{:08X} | "
+        "aceptada={} dwords={:08X},{:08X},{:08X},{:08X}",
+        me_shaders, me_sin_constantes, me_rechazadas, me_aceptadas, me_es_vertice, me_eM,
+        me_constante, me_dwords[0], me_dwords[1], me_dwords[2], me_dwords[3], me_ok_constante,
+        me_ok_dwords[0], me_ok_dwords[1], me_ok_dwords[2], me_ok_dwords[3]);
+    REXLOG_WARN("[SONDA-flujo2] formato={} indices={} largo={}", me_ok_formato, me_ok_indices,
+                me_primer_largo);
+    REXLOG_WARN(
+        "[SONDA-vfexp] vfetchUsados={} enMemexport={} ultimo={:08X} largo={} rango={:08X} "
+        "rangoLargo={}",
+        vfetch_total, vfetch_en_export, vfetch_export_dir, vfetch_export_largo,
+        vfetch_export_rango, vfetch_export_rango_largo);
+    // TODOS los pares, y ANTES del bucle de los cuatro mas dibujados: ese bucle pone
+    // `dibujos = 0` en cada pareja que ya ha informado, asi que imprimir despues de el
+    // dejaba fuera justo las parejas MAS dibujadas - que son las del escenario y, por
+    // tanto, las que mas importan cuando se busca a que pareja pertenece algo.
+    // ponytail: se comprobo moviendolo aqui; si algun dia vuelve a hacer falta el
+    // listado, que sea antes del bucle de 4, no despues.
+    for (uint32_t i = 0; i < pares_usados; ++i) {
+      if (pares[i].dibujos == 0) {
+        continue;
+      }
+      REXLOG_WARN("[SONDA-par4] VS={:016X} PS={:016X} dibujos={} vertices={} recorte={},{}-{},{} "
+                  "vista={}x{}",
+                  pares[i].vs, pares[i].ps, pares[i].dibujos, pares[i].vertices,
+                  pares[i].recorte[0], pares[i].recorte[1], pares[i].recorte[2],
+                  pares[i].recorte[3], pares[i].vista[0], pares[i].vista[1]);
+      // La huella de las texturas de este par, para contar las de todos los pares y no
+      // solo las del cuarto mas dibujado.
+      for (uint32_t t = 0; t < pares[i].tex_huecos; ++t) {
+        REXLOG_WARN("[SONDA-par5] VS={:016X} PS={:016X} fc={} base={:X} mip={:X} fmt={} wh={}x{}",
+                    pares[i].vs, pares[i].ps, pares[i].tex_fc[t], pares[i].tex_base[t],
+                    pares[i].tex_mip[t], pares[i].tex_fmt[t], pares[i].tex_wh[t][0],
+                    pares[i].tex_wh[t][1]);
+      }
+    }
+    for (uint32_t n = 0; n < 4 && pares_usados; ++n) {
+      uint32_t mejor = UINT32_MAX;
+      for (uint32_t i = 0; i < pares_usados; ++i) {
+        if (pares[i].dibujos == 0) {
+          continue;
+        }
+        if (mejor == UINT32_MAX || pares[i].dibujos > pares[mejor].dibujos) {
+          mejor = i;
+        }
+      }
+      if (mejor == UINT32_MAX) {
+        break;
+      }
+      REXLOG_WARN(
+          "[SONDA-par] VS={:016X} PS={:016X} dibujos={} vertices={} recorte={},{}-{},{} "
+          "vista={}x{} constVS={}/256 constPS={}/256 c0={:08X},{:08X},{:08X},{:08X} "
+          "escala={}x{} muestras={}",
+          pares[mejor].vs, pares[mejor].ps, pares[mejor].dibujos, pares[mejor].vertices,
+          pares[mejor].recorte[0], pares[mejor].recorte[1], pares[mejor].recorte[2],
+          pares[mejor].recorte[3], pares[mejor].vista[0], pares[mejor].vista[1],
+          pares[mejor].vs_const_no_cero, pares[mejor].ps_const_no_cero, pares[mejor].vs_c0[0],
+          pares[mejor].vs_c0[1], pares[mejor].vs_c0[2], pares[mejor].vs_c0[3],
+          pares[mejor].ancho_vista, pares[mejor].alto_vista, pares[mejor].muestras);
+      REXLOG_WARN(
+          "[SONDA-par2] VS={:016X} colorInfo={:08X} depthInfo={:08X} surfInfo={:08X} "
+          "mode={:08X} colorMask={:08X} blend0={:08X} scMode={:08X} clip={:08X} "
+          "zEsc={} zDes={} depthCntl={:08X} stencil={:08X} vte={:08X}",
+          pares[mejor].vs, pares[mejor].color_info, pares[mejor].depth_info,
+          pares[mejor].surface_info, pares[mejor].modecontrol, pares[mejor].color_mask,
+          pares[mejor].blend0, pares[mejor].sc_mode_cntl, pares[mejor].clip_cntl,
+          pares[mejor].vport_zscale, pares[mejor].vport_zoffset, pares[mejor].depth_control,
+          pares[mejor].stencil_ref_mask, pares[mejor].vte_cntl);
+      REXLOG_WARN(
+          "[SONDA-par3] VS={:016X} psColor={} psProf={} psMata={} psExporta={} vsExporta={} "
+          "colorCntl={:08X}",
+          pares[mejor].vs, pares[mejor].ps_escribe_color, pares[mejor].ps_escribe_prof,
+          pares[mejor].ps_mata_pixeles, pares[mejor].ps_exporta, pares[mejor].vs_exporta,
+          pares[mejor].color_control);
+      REXLOG_WARN(
+          "[SONDA-const] VS={:016X} mapaVS={}/din={} mapaPS={}/din={} c74={:08X},{:08X},"
+          "{:08X},{:08X} c75={:08X},{:08X},{:08X},{:08X}",
+          pares[mejor].vs, pares[mejor].vs_mapa[0], pares[mejor].vs_mapa[1],
+          pares[mejor].ps_mapa[0], pares[mejor].ps_mapa[1], pares[mejor].vs_c74[0][0],
+          pares[mejor].vs_c74[0][1], pares[mejor].vs_c74[0][2], pares[mejor].vs_c74[0][3],
+          pares[mejor].vs_c74[1][0], pares[mejor].vs_c74[1][1], pares[mejor].vs_c74[1][2],
+          pares[mejor].vs_c74[1][3]);
+      REXLOG_WARN(
+          "[SONDA-const2] VS={:016X} c195={:08X},{:08X},{:08X},{:08X} c242={:08X},{:08X},"
+          "{:08X},{:08X} c243={:08X},{:08X},{:08X},{:08X}",
+          pares[mejor].vs, pares[mejor].ps_c[0][0], pares[mejor].ps_c[0][1],
+          pares[mejor].ps_c[0][2], pares[mejor].ps_c[0][3], pares[mejor].ps_c[1][0],
+          pares[mejor].ps_c[1][1], pares[mejor].ps_c[1][2], pares[mejor].ps_c[1][3],
+          pares[mejor].ps_c[2][0], pares[mejor].ps_c[2][1], pares[mejor].ps_c[2][2],
+          pares[mejor].ps_c[2][3]);
+      REXLOG_WARN(
+          "[SONDA-const3] VS={:016X} c254={:08X},{:08X},{:08X},{:08X} c255={:08X},{:08X},"
+          "{:08X},{:08X}",
+          pares[mejor].vs, pares[mejor].ps_c[3][0], pares[mejor].ps_c[3][1],
+          pares[mejor].ps_c[3][2], pares[mejor].ps_c[3][3], pares[mejor].ps_c[4][0],
+          pares[mejor].ps_c[4][1], pares[mejor].ps_c[4][2], pares[mejor].ps_c[4][3]);
+      REXLOG_WARN("[SONDA-vsceros] VS={:016X} bancoVS={}", pares[mejor].vs,
+                  pares[mejor].vs_mapa_ceros);
+      REXLOG_WARN(
+          "[SONDA-vfetch] VS={:016X} dw0={:08X} dw1={:08X} colorInfo0={:08X} colorMask0={:08X} "
+          "blend0={:08X}",
+          pares[mejor].vs, pares[mejor].vs_vfetch_dw[0], pares[mejor].vs_vfetch_dw[1],
+          pares[mejor].color_info0, pares[mejor].color_mask0, pares[mejor].blend0);
+      if (pares[mejor].v1_leidos != 0) {
+        for (uint32_t i = 0; i < 3; ++i) {
+          REXLOG_WARN(
+              "[SONDA-v1] VS={:016X} o{} vertices={} min={:.4f},{:.4f},{:.4f},{:.4f} "
+              "max={:.4f},{:.4f},{:.4f},{:.4f} media={:.4f},{:.4f},{:.4f},{:.4f}",
+              pares[mejor].vs, i, pares[mejor].v1_leidos, pares[mejor].interp_min[i][0],
+              pares[mejor].interp_min[i][1], pares[mejor].interp_min[i][2],
+              pares[mejor].interp_min[i][3], pares[mejor].interp_max[i][0],
+              pares[mejor].interp_max[i][1], pares[mejor].interp_max[i][2],
+              pares[mejor].interp_max[i][3], pares[mejor].interp_media[i][0],
+              pares[mejor].interp_media[i][1], pares[mejor].interp_media[i][2],
+              pares[mejor].interp_media[i][3]);
+        }
+      }
+      if (pares[mejor].vs_salida_leida != 0) {
+        for (uint32_t i = 0; i < 3; ++i) {
+          if (!(pares[mejor].vs_salida_leida & (1u << i))) {
+            continue;
+          }
+          REXLOG_WARN(
+              "[SONDA-vssalida] VS={:016X} o{} mascara={:X} bits={:08X},{:08X},{:08X},{:08X} "
+              "valor={:.5f},{:.5f},{:.5f},{:.5f}",
+              pares[mejor].vs, i, pares[mejor].vs_salida_mascara[i], pares[mejor].vs_salida[i][0],
+              pares[mejor].vs_salida[i][1], pares[mejor].vs_salida[i][2],
+              pares[mejor].vs_salida[i][3],
+              rex::memory::Reinterpret<float>(pares[mejor].vs_salida[i][0]),
+              rex::memory::Reinterpret<float>(pares[mejor].vs_salida[i][1]),
+              rex::memory::Reinterpret<float>(pares[mejor].vs_salida[i][2]),
+              rex::memory::Reinterpret<float>(pares[mejor].vs_salida[i][3]));
+        }
+      }
+      for (uint32_t n = 0; n < 15; n += 3) {
+        REXLOG_WARN(
+            "[SONDA-vsc] VS={:016X} c{}={:08X},{:08X},{:08X},{:08X} c{}={:08X},{:08X},{:08X},"
+            "{:08X} c{}={:08X},{:08X},{:08X},{:08X}",
+            pares[mejor].vs, kIndicesVs[n], pares[mejor].vs_c[n][0], pares[mejor].vs_c[n][1],
+            pares[mejor].vs_c[n][2], pares[mejor].vs_c[n][3], kIndicesVs[n + 1],
+            pares[mejor].vs_c[n + 1][0], pares[mejor].vs_c[n + 1][1], pares[mejor].vs_c[n + 1][2],
+            pares[mejor].vs_c[n + 1][3], kIndicesVs[n + 2], pares[mejor].vs_c[n + 2][0],
+            pares[mejor].vs_c[n + 2][1], pares[mejor].vs_c[n + 2][2], pares[mejor].vs_c[n + 2][3]);
+      }
+      REXLOG_WARN(
+          "[SONDA-tex] VS={:016X} PS={:016X} usadas={} distintas={} tipoMalo={} sinPagina={} "
+          "gammaComoUnorm16={} signosSistema={:08X},{:08X}",
+          pares[mejor].vs, pares[mejor].ps, pares[mejor].tex_usadas, pares[mejor].tex_huecos,
+          pares[mejor].tex_malas, pares[mejor].tex_sin_pagina,
+          REXCVAR_GET(gamma_render_target_as_unorm16) ? 1 : 0, signos_sistema_0, signos_sistema_1);
+      // El enlace REAL: el indice de descriptor y la clave de textura que resuelve.
+      // Es lo unico que puede cambiar sin que cambie ningun fetch constant, que es
+      // justo el sintoma del cuerpo que se pone negro entre dos fotogramas.
+      if (pares[mejor].enlaces_reales_usados) {
+        REXLOG_WARN(
+            "[SONDA-srv] VS={:016X} monton={:016X} tamDesc={} enlaces={} signosSistema={:08X}",
+            pares[mejor].vs, pares[mejor].descriptor_heap_pixel,
+            pares[mejor].descriptor_buffer_pixel, pares[mejor].enlaces_reales_usados,
+            signos_sistema_0);
+        for (uint32_t e = 0; e < pares[mejor].enlaces_reales_usados; ++e) {
+          const ParShaders::EnlaceReal& r = pares[mejor].enlaces_reales[e];
+          REXLOG_WARN(
+              "[SONDA-srv] VS={:016X} fc={} usos={} sinSigno={} conSigno={} nuloSin={} "
+              "nuloCon={} firmadoFlag={} base={:X} mip={:X} fmt={} wh={}x{} niveles={} "
+              "swizzleHost={:03X} signos={:02X} vw={:08X} banderas={:08X}",
+              pares[mejor].vs, r.fc, r.usos, r.indice_sin_signo, r.indice_con_signo,
+              r.indice_sin_signo == UINT32_MAX ? 1 : 0, r.indice_con_signo == UINT32_MAX ? 1 : 0,
+              r.es_firmado, r.base, r.mip, r.fmt, r.ancho, r.alto, r.niveles, r.swizzle_host,
+              r.signos,
+              r.indice_sin_signo == UINT32_MAX
+                  ? 0
+                  : uint32_t(pares[mejor].descriptor_heap_pixel +
+                             uint64_t(r.indice_sin_signo) * pares[mejor].descriptor_buffer_pixel),
+              r.banderas_clave);
+        }
+      }
+      for (uint32_t s = 0; s < pares[mejor].muestreadores_usados; ++s) {
+        const ParShaders::Muestreador& m = pares[mejor].muestreadores[s];
+        REXLOG_WARN(
+            "[SONDA-lod] VS={:016X} fc={} usos={} visitaMag={} visitaMin={} visitaMip={} "
+            "visitaAniso={} visitaLodBias={} visitaNivelMin={} visitaNivelMax={} | host={:08X} "
+            "hostMagLineal={} hostMinLineal={} hostMipLineal={} hostAniso={} hostNivelMin={} "
+            "hostBaseMap={} hostClamp={}",
+            pares[mejor].vs, m.fc, m.usos, m.fetch_mag, m.fetch_min, m.fetch_mip, m.fetch_aniso,
+            m.fetch_lod_bias, m.fetch_mip_min, m.fetch_mip_max, m.muestreador_valor,
+            m.muestreador_mag, m.muestreador_min, m.muestreador_mip, m.muestreador_aniso,
+            m.muestreador_mip_min, m.muestreador_base_map, m.clamp);
+      }
+    // Y la tabla de estados de material del par, que es la que se compara entre la
+    // pelea de luchadores normales y la del creado.
+    if (pares[mejor].estados_usados || pares[mejor].estados_saturados) {
+      REXLOG_WARN("[SONDA-est] VS={:016X} PS={:016X} dibujos={} estados={} saturados={}",
+                  pares[mejor].vs, pares[mejor].ps, pares[mejor].dibujos_del_par,
+                  pares[mejor].estados_usados, pares[mejor].estados_saturados);
+      // Lo que de verdad importa: el contenido de cada textura del par a lo largo de la
+      // sesion. Si una se pone negra y vuelve, aqui esta, con la hora.
+      for (uint32_t s = 0; s < pares[mejor].seguimiento_usado; ++s) {
+        const ParShaders::SeguimientoTex& g = pares[mejor].seguimiento[s];
+        REXLOG_WARN(
+            "[SONDA-est] VS={:016X} textura fc={} base={:X} medidas={} media min={} "
+            "max={} ultima={} huellasDistintas={} horaMin={}",
+            pares[mejor].vs, g.fc, g.base, g.usada, g.media_min, g.media_max, g.media_ultima,
+            g.huellas, g.hora_min);
+      }
+      for (uint32_t e = 0; e < pares[mejor].estados_usados; ++e) {
+        ImprimeDibujo(pares[mejor].estados[e], "ESTADO");
+        REXLOG_WARN("[SONDA-est] VS={:016X} estado={} veces={} primera={} ultima={}",
+                    pares[mejor].vs, e, pares[mejor].estados[e].veces,
+                    pares[mejor].estados[e].primera, pares[mejor].estados[e].ultima);
+      }
+    }
+      for (uint32_t t = 0; t < pares[mejor].tex_huecos; ++t) {
+        REXLOG_WARN(
+            "[SONDA-tex2] VS={:016X} fc={} dibujos={} tipo={} enRT={} base={:X} mip={:X} fmt={} "
+            "wh={}x{} endian={} tiled={} expAjuste={} numFmt={} "
+            "dwords={:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+            pares[mejor].vs, pares[mejor].tex_fc[t], pares[mejor].tex_dibujos[t],
+            pares[mejor].tex_tipo[t], pares[mejor].tex_en_rt[t], pares[mejor].tex_base[t],
+            pares[mejor].tex_mip[t], pares[mejor].tex_fmt[t], pares[mejor].tex_wh[t][0],
+            pares[mejor].tex_wh[t][1], pares[mejor].tex_endian[t], pares[mejor].tex_tiled[t],
+            pares[mejor].tex_exp_adjust[t], pares[mejor].tex_num_format[t],
+            pares[mejor].tex_dw[t][0], pares[mejor].tex_dw[t][1], pares[mejor].tex_dw[t][2],
+            pares[mejor].tex_dw[t][3], pares[mejor].tex_dw[t][4], pares[mejor].tex_dw[t][5]);
+        REXLOG_WARN(
+            "[SONDA-tex3] VS={:016X} fc={} leidos={} enlace={} objeto={} swizzle={:08X} "
+            "signos={:02X} ceros={}% valores={} vistos={} "
+            "bytes={:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+            pares[mejor].vs, pares[mejor].tex_fc[t], pares[mejor].tex_bytes_leidos[t],
+            pares[mejor].tex_enlace[t], pares[mejor].tex_objeto[t], pares[mejor].tex_swizzle[t],
+            pares[mejor].tex_signos[t], pares[mejor].tex_ceros[t], pares[mejor].tex_varios[t],
+            pares[mejor].tex_bytes_vistos[t],
+            pares[mejor].tex_bytes[t][0], pares[mejor].tex_bytes[t][1],
+            pares[mejor].tex_bytes[t][2], pares[mejor].tex_bytes[t][3],
+            pares[mejor].tex_bytes[t][4], pares[mejor].tex_bytes[t][5],
+            pares[mejor].tex_bytes[t][6], pares[mejor].tex_bytes[t][7]);
+      }
+      REXLOG_WARN(
+          "[SONDA-vert] VS={:016X} prim={} indices={} verts={} declarados={} vfetch0={}/{}/{}t{} "
+          "vfetch1={}/{}/{}t{} vfetch2={}/{}/{}t{} vfetch3={}/{}/{}t{}",
+          pares[mejor].vs, pares[mejor].prim, pares[mejor].indices, pares[mejor].vertices,
+          pares[mejor].vfetch_leidos, pares[mejor].vfetch[0][0], pares[mejor].vfetch[0][1],
+          pares[mejor].vfetch[0][2], pares[mejor].vfetch_tipo[0], pares[mejor].vfetch[1][0],
+          pares[mejor].vfetch[1][1], pares[mejor].vfetch[1][2], pares[mejor].vfetch_tipo[1],
+          pares[mejor].vfetch[2][0], pares[mejor].vfetch[2][1], pares[mejor].vfetch[2][2],
+          pares[mejor].vfetch_tipo[2], pares[mejor].vfetch[3][0], pares[mejor].vfetch[3][1],
+          pares[mejor].vfetch[3][2], pares[mejor].vfetch_tipo[3]);
+      {
+        std::string hex;
+        for (uint32_t b = 0; b < pares[mejor].vfetch_bytes_leidos; ++b) {
+          hex += fmt::format("{:08X} ", pares[mejor].vfetch_bytes[b]);
+        }
+        REXLOG_WARN("[SONDA-vert2] VS={:016X} bytes={} {}", pares[mejor].vs,
+                    pares[mejor].vfetch_bytes_leidos, hex);
+      }
+      pares[mejor].dibujos = 0;
+      // Y la tabla de estados se vacia: asi cada informe es una VENTANA de tiempo y se
+      // pueden comparar la ventana en que el luchador sale bien con la que sale negro,
+      // en vez de una tabla acumulada que mezcla las dos.
+      pares[mejor].estados_usados = 0;
+      pares[mejor].estados_saturados = 0;
+      pares[mejor].dibujos_del_par = 0;
+      pares[mejor].tex_ultimas_n = 0;
+    }
+    pares_usados = 0;
+    total = pintados = vertices = 0;
+    sin_vs = pitch0 = sin_raster = sin_vertices = 0;
+    pipeline_fallido = async_pendiente = bindings_fallido = 0;
+    vfetch_invalido = vfetch_sin_rango = 0;
+    memexport = sin_ps = swaps = copias = sin_rt = 0;
+    copia_destino = copia_longitud = copia_repeticiones = 0;
+    copias_frente = 0;
+    swap_ptr = swap_ancho = swap_alto = 0;
+    memexport_rangos = memexport_bytes = 0;
+    me_shaders = me_sin_constantes = me_rechazadas = me_aceptadas = 0;
+    me_constante = me_eM = me_es_vertice = 0;
+    me_dwords[0] = me_dwords[1] = me_dwords[2] = me_dwords[3] = 0;
+    me_aceptadas = me_ok_constante = 0;
+    me_ok_dwords[0] = me_ok_dwords[1] = me_ok_dwords[2] = me_ok_dwords[3] = 0;
+    vfetch_en_export = vfetch_total = 0;
+    vfetch_export_dir = vfetch_export_largo = 0;
+    vfetch_export_rango = vfetch_export_rango_largo = 0;
+    me_ok_formato = me_ok_indices = me_primer_base = me_primer_largo = 0;
+    me_rango_max = me_rango_max_base = 0;
+    me_recientes.clear();
+    std::memset(fmt_color, 0, sizeof(fmt_color));
+    std::memset(fmt_prof, 0, sizeof(fmt_prof));
+  }
+};
+SondaDibujos g_sonda_dibujos;
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -104,43 +2087,12 @@ void D3D12CommandProcessor::InsertDebugMarker(const char* format, ...) {
 
 void D3D12CommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
-  InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
 }
 
 void D3D12CommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
     shared_memory_->InvalidateAllPages();
-  }
-}
-
-void D3D12CommandProcessor::InvalidateAllVertexBufferResidency() {
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
-  for (VertexBufferState& state : vertex_buffer_states_) {
-    state.address = UINT32_MAX;
-    state.size = UINT32_MAX;
-  }
-}
-
-void D3D12CommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_index) {
-  if (vfetch_index >= vertex_buffer_states_.size()) {
-    return;
-  }
-  vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
-}
-
-void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
-                                                                 uint32_t last_vfetch) {
-  if (first_vfetch > last_vfetch) {
-    std::swap(first_vfetch, last_vfetch);
-  }
-  if (first_vfetch >= vertex_buffer_states_.size()) {
-    return;
-  }
-  last_vfetch = std::min(last_vfetch, uint32_t(vertex_buffer_states_.size() - 1));
-  for (uint32_t vfetch_index = first_vfetch; vfetch_index <= last_vfetch; ++vfetch_index) {
-    InvalidateVertexBufferResidency(vfetch_index);
   }
 }
 
@@ -163,7 +2115,8 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
 
   uint32_t sample_count_addr = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
   auto* sample_counts =
-      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
+      memory_->TranslateVirtual<xenos::xe_gpu_depth_sample_counts*>(
+          0xA0000000u | (sample_count_addr & 0x1FFFFFFFu));
   if (!sample_counts) {
     DisableHostOcclusionQueries();
     return true;
@@ -859,7 +2812,6 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
   }
-  InvalidateAllVertexBufferResidency();
   UpdateDebugMarkersEnabled();
 
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -926,7 +2878,7 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
-  if (!shared_memory_->Initialize()) {
+  if (!shared_memory_->Initialize(draw_resolution_scale_x == 1 && draw_resolution_scale_y == 1)) {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
   }
@@ -1499,7 +3451,7 @@ bool D3D12CommandProcessor::SetupContext() {
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kNullRawUAV)),
         nullptr, 0);
-    // kNullTexture2DArray.
+    // kNullTexture2DArray: null descriptors return transparent black.
     D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc;
     null_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     null_srv_desc.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
@@ -1627,8 +3579,18 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  if (!packet_memory_writes_.empty() && EndSubmission(false)) {
+    CheckSubmissionFence(packet_memory_writes_.back().submission);
+  }
+  // Flush while the pipeline/deferred-command/readback resources still exist.
+  // The worker has closed/drained its CPU-provider queue before this point.
+  if (shared_memory_ && shared_memory_->HasCpuReadback()) {
+    if (!shared_memory_->SynchronizeForCpu(0, SharedMemory::kBufferSize)) {
+      REXGPU_ERROR("Could not preserve GPU-written memory during device shutdown");
+    }
+    shared_memory_->ShutdownCpuReadback();
+  }
   AwaitAllQueueOperationsCompletion();
-  InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
@@ -1797,7 +3759,6 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
     }
-    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 
@@ -1876,7 +3837,6 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
   }
 
@@ -1893,9 +3853,11 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  ++g_sonda_dibujos.swaps;
+  g_sonda_dibujos.swap_ptr = frontbuffer_ptr;
+  g_sonda_dibujos.swap_ancho = frontbuffer_width;
+  g_sonda_dibujos.swap_alto = frontbuffer_height;
   SCOPE_profile_cpu_f("gpu");
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
 
   if (!graphics_system_)
     return;
@@ -2271,6 +4233,9 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
+  ++g_sonda_dibujos.total;
+  g_sonda_dibujos.Informe(memory_, system_constants_.texture_swizzled_signs[0],
+                          system_constants_.texture_swizzled_signs[1]);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2290,6 +4255,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
+    ++g_sonda_dibujos.sin_vs;
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -2301,6 +4267,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
+    ++g_sonda_dibujos.pitch0;
     return true;
   }
   D3D12Shader* pixel_shader = nullptr;
@@ -2321,6 +4288,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      ++g_sonda_dibujos.sin_raster;
       return true;
     }
   }
@@ -2338,6 +4306,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
+    ++g_sonda_dibujos.sin_vertices;
     return true;
   }
 
@@ -2396,11 +4365,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
           normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
+    ++g_sonda_dibujos.pipeline_fallido;
     return false;
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    // Keep the draw. EndSubmission waits for queued PSOs before replaying the
+    // deferred command list, including one-shot texture-generation passes.
+    ++g_sonda_dibujos.async_pendiente;
   }
 
   // Update the textures - this may bind pipelines.
@@ -2471,6 +4443,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+    ++g_sonda_dibujos.bindings_fallido;
     return false;
   }
   // Must not call anything that can change the descriptor heap from now on!
@@ -2483,10 +4456,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
-      uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
-        continue;
-      }
+      // SharedMemory owns page validity. An unchanged fetch can still reference
+      // CPU-written or frame-invalidated data, so always revalidate the range.
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
@@ -2495,6 +4466,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
             break;
           }
+          ++g_sonda_dibujos.vfetch_invalido;
           REXGPU_WARN(
               "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
               "This is incorrect behavior, but you can try bypassing this by "
@@ -2502,25 +4474,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
         default:
+          ++g_sonda_dibujos.vfetch_invalido;
           REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
-      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-        continue;
-      }
+      g_sonda_dibujos.AnotaVfetchEnExport(vfetch_constant);
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+        ++g_sonda_dibujos.vfetch_sin_rango;
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
       }
-      state.address = vfetch_constant.address;
-      state.size = vfetch_constant.size;
-      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
 
@@ -2530,11 +4497,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   memexport_ranges_.clear();
   if (memexport_used_vertex) {
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
+    g_sonda_dibujos.AnotaStreams(regs, *vertex_shader, true);
   }
   if (memexport_used_pixel) {
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
+    g_sonda_dibujos.AnotaStreams(regs, *pixel_shader, false);
   }
-  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+  for (draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    // The stream constant's element count can be larger than what the game
+    // allocated - clamping it keeps everything derived from the range inside
+    // that allocation.
+    draw_util::ClampMemExportRangeToAllocation(memexport_range, memory_);
+    g_sonda_dibujos.AnotaMemexport(memexport_range, memory_);
     if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
                                       memexport_range.size_bytes)) {
       REXGPU_ERROR(
@@ -2545,7 +4519,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
   if (memexport_used && memexport_ranges_.empty()) {
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+    if (!shared_memory_->RequestAllAllocatedRanges()) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
@@ -2709,7 +4683,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     } else {
       // Stream constants can be invalid or dynamic, so exact destinations may
       // be unknown. Keep invalidation conservative in this case.
-      shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+      shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize, false);
     }
     if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
         !memexport_ranges_.empty()) {
@@ -2727,10 +4701,127 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  ++g_sonda_dibujos.pintados;
+  g_sonda_dibujos.vertices += primitive_processing_result.host_draw_vertex_count;
+  g_sonda_dibujos.memexport += memexport_used ? 1 : 0;
+  g_sonda_dibujos.sin_ps += pixel_shader ? 0 : 1;
+  g_sonda_dibujos.sin_rt += bound_depth_and_color_render_target_bits ? 0 : 1;
+  if (bound_depth_and_color_render_target_formats[0] < 96) {
+    ++g_sonda_dibujos.fmt_prof[bound_depth_and_color_render_target_formats[0]];
+  }
+  if (bound_depth_and_color_render_target_formats[1] < 96) {
+    ++g_sonda_dibujos.fmt_color[bound_depth_and_color_render_target_formats[1]];
+  }
+  g_sonda_dibujos.ultimo_vs = vertex_shader->ucode_data_hash();
+  // Un dibujo sin shader de pixeles tiene que contarse como tal: si no, el par
+  // hereda el hash del dibujo anterior y el informe miente.
+  g_sonda_dibujos.ultimo_ps = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+  g_sonda_dibujos.AnotaPar(g_sonda_dibujos.ultimo_vs, g_sonda_dibujos.ultimo_ps,
+                           primitive_processing_result.host_draw_vertex_count, regs, memory_,
+                           uint32_t(primitive_type), index_count, vertex_shader, pixel_shader,
+                           texture_cache_.get(),
+                           texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1,
+                           texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1,
+                           uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+                           texture_cache_.get(),
+                           (pixel_shader != nullptr &&
+                            current_texture_layout_uid_pixel_ ==
+                                pixel_shader->GetTextureBindingLayoutUserUID())
+                               ? &current_texture_srv_keys_pixel_
+                               : nullptr,
+                           bindless_resources_used_ ? GetViewBindlessHeapCPUStart().ptr : 0,
+                           bindless_resources_used_ ? GetD3D12Provider().GetViewDescriptorSize()
+                                                    : 0);
+  // Y el dibujo suelto: se imprime solo cuando su huella cambia respecto al dibujo
+  // anterior del mismo par, que es el unico sitio donde se ve el fallo que aparece y
+  // desaparece entre fotogramas con todos los agregados iguales.
+  g_sonda_dibujos.AnotaDibujo(vertex_shader, pixel_shader, regs, memory_, texture_cache_.get(),
+                              uint32_t(primitive_type), index_count,
+                              primitive_processing_result.host_draw_vertex_count,
+                              pixel_shader != nullptr, g_sonda_dibujos.ultimo_vs,
+                              g_sonda_dibujos.ultimo_ps, &primitive_processing_result);
+  // Temporary, bounded capture of the selected fighter atlas material.
+  if (IsDiagnosticMaterial(g_sonda_dibujos.ultimo_ps) &&
+      REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) > 0) {
+    static std::array<uint32_t, 16> captured_bases{};
+    const uint32_t base = uint32_t(regs.GetTextureFetch(0).base_address) << 12;
+    auto slot = std::find(captured_bases.begin(), captured_bases.end(), 0u);
+    if (base && slot != captured_bases.end() &&
+        std::find(captured_bases.begin(), captured_bases.end(), base) == captured_bases.end() &&
+        BeginSubmission(false)) {
+      *slot = base;
+      struct Capture {
+        uint32_t fetch = 0;
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+        D3D12_RESOURCE_DESC description{};
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+        uint64_t bytes = 0;
+      } captures[3];
+      bool queued = false;
+      const bool hair = g_sonda_dibujos.ultimo_ps == 0x2C56B11C103C5673ull;
+      for (uint32_t i = 0; i < (hair ? 2u : 3u); ++i) {
+        Capture& capture = captures[i];
+        capture.fetch = i == 0 ? 0 : (hair || i == 2 ? 13 : 1);
+        queued |= texture_cache_->QueueActiveTextureReadback(
+            capture.fetch, capture.buffer, capture.description, capture.layouts, capture.bytes);
+      }
+      const uint64_t capture_submission = GetCurrentSubmission();
+      if (queued && (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion() || device_removed_)) {
+        for (Capture& capture : captures) {
+          if (capture.buffer) {
+            resources_for_deletion_.emplace_back(capture_submission, capture.buffer.Detach());
+          }
+        }
+        REXGPU_WARN("[GPU-host] capture failed before completion for material {:08X}", base);
+      } else if (queued) {
+        for (Capture& capture : captures) {
+          if (!capture.buffer) {
+            continue;
+          }
+          D3D12_RANGE range = {0, SIZE_T(capture.bytes)};
+          void* mapping = nullptr;
+          if (FAILED(capture.buffer->Map(0, &range, &mapping))) {
+            REXGPU_WARN("[GPU-host] capture map failed for material {:08X} fc={}", base, capture.fetch);
+            continue;
+          }
+          const std::string prefix = fmt::format("capturas/gpu_host_{:08X}_fc{}", base, capture.fetch);
+          std::ofstream raw(prefix + ".bin", std::ios::binary);
+          raw.write(static_cast<const char*>(mapping), std::streamsize(capture.bytes));
+          std::ofstream metadata(prefix + ".json");
+          metadata << fmt::format("{{\"material_base\":{},\"fetch\":{},\"format\":{},\"width\":{},"
+                                  "\"height\":{},\"array_size\":{},\"mips\":{},\"subresources\":[",
+                                  base, capture.fetch, uint32_t(capture.description.Format),
+                                  capture.description.Width, capture.description.Height,
+                                  capture.description.DepthOrArraySize, capture.description.MipLevels);
+          for (size_t i = 0; i < capture.layouts.size(); ++i) {
+            const auto& layout = capture.layouts[i];
+            metadata << fmt::format("{}{{\"offset\":{},\"row_pitch\":{},\"width\":{},\"height\":{},"
+                                    "\"depth\":{},\"format\":{}}}",
+                                    i ? "," : "", layout.Offset, layout.Footprint.RowPitch,
+                                    layout.Footprint.Width, layout.Footprint.Height,
+                                    layout.Footprint.Depth, uint32_t(layout.Footprint.Format));
+          }
+          metadata << "]}";
+          REXGPU_WARN("[GPU-host] material={:08X} fc={} path={} bytes={} saved={}",
+                      base, capture.fetch, prefix, capture.bytes, bool(raw) && bool(metadata));
+          D3D12_RANGE no_writes = {};
+          capture.buffer->Unmap(0, &no_writes);
+        }
+      }
+    }
+  }
   return true;
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
+  if (shared_memory_->HasCpuReadback()) {
+    uint32_t first = SharedMemory::kBufferSize, end = 0;
+    for (const auto& range : memexport_ranges_) {
+      first = std::min(first, range.base_address_dwords << 2);
+      end = std::max(end, (range.base_address_dwords << 2) + range.size_bytes);
+    }
+    return end <= first || shared_memory_->SynchronizeForCpu(first, end - first);
+  }
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
@@ -2776,6 +4867,11 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_size) {
+  if (shared_memory_->HasCpuReadback()) {
+    // CPU faults obtain the current generation. Publishing last-frame bytes
+    // here could race a CPU store after another provider completed.
+    return true;
+  }
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
@@ -2871,19 +4967,168 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
+  ++g_sonda_dibujos.copias;
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
-#endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+#endif
   if (!BeginSubmission(true)) {
     return false;
   }
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
-    uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+  if (!texture_cache_->IsDrawResolutionScaled()) {
+    uint32_t address, length;
+    if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, address, length)) {
+      return false;
+    }
+    g_sonda_dibujos.AnotaCopia(address, length);
+    // Ordinary resolves remain on the GPU. CPU faults deliver only the dirty
+    // runs they consume; an explicit full request remains synchronous.
+    return GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve)) != ReadbackResolveMode::kFull ||
+           shared_memory_->SynchronizeForCpu(address, length);
   }
+  // Scaled output lives outside SharedMemory. Keep its immediate accurate
+  // downscale path; never arm a raw SharedMemory provider for these pages.
   return IssueCopy_ReadbackResolvePath();
+}
+
+bool D3D12CommandProcessor::WriteGpuMemory(uint32_t address, uint32_t value) {
+  address &= SharedMemory::kBufferSize - 1;
+  if (!shared_memory_->HasCpuReadback()) {
+    if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion() || device_removed_) {
+      return false;
+    }
+    memory::store(memory_->TranslateVirtual(0xA0000000u | address), value);
+    return true;
+  }
+  // The word is known on the CPU. Preserve any shader-generated neighbours.
+  // Keep the current batch open: its fence also orders all queued word writes.
+  if (!shared_memory_->SynchronizeForCpu(address, sizeof(value)) || device_removed_) {
+    return false;
+  }
+  if (queue_operations_done_since_submission_signal_ && !submission_open_ &&
+      !BeginSubmission(false)) {
+    return false;
+  }
+  // Future GPU consumers must reload this page after the pending word has been
+  // published. CPU readers may observe the old completion value until then.
+  shared_memory_->MemoryInvalidationCallback(address, sizeof(value), true);
+  packet_memory_writes_.push_back(
+      {submission_current_ - uint64_t(!submission_open_), address, value});
+  PublishPacketMemoryWrites(submission_fence_->GetCompletedValue());
+  return !device_removed_;
+}
+
+void D3D12CommandProcessor::PublishPacketMemoryWrites(uint64_t completed_submission) {
+  if (completed_submission == UINT64_MAX) {
+    device_removed_ = true;
+  }
+  if (device_removed_ || publishing_packet_memory_writes_) {
+    return;
+  }
+  publishing_packet_memory_writes_ = true;
+  struct Reset {
+    bool& flag;
+    ~Reset() { flag = false; }
+  } reset{publishing_packet_memory_writes_};
+  while (!packet_memory_writes_.empty() &&
+         packet_memory_writes_.front().submission <= completed_submission) {
+    const auto write = packet_memory_writes_.front();
+    memory::store(memory_->TranslateVirtual(0xA0000000u | write.address), write.value);
+    packet_memory_writes_.pop_front();
+  }
+}
+
+bool D3D12CommandProcessor::PreparePacketMemoryReads(
+    const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+  if (publishing_packet_memory_writes_) {
+    return true;
+  }
+  uint64_t await_submission = 0;
+  const uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
+  for (const auto& write : packet_memory_writes_) {
+    for (size_t i = 0; i < count; ++i) {
+      // Uploads preserve whole host pages, including words outside the exact
+      // shader fetch. Resolve pending words before any such page is uploaded.
+      if (ranges[i].second && (write.address | page_mask) >= ranges[i].first &&
+          (write.address & ~page_mask) < uint64_t(ranges[i].first) + ranges[i].second) {
+        await_submission = write.submission;
+        break;
+      }
+    }
+  }
+  if (await_submission) {
+    CheckSubmissionFence(await_submission);
+    if (submission_completed_ < await_submission || device_removed_) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::PrepareForWait() {
+  // Keep CPU handshakes independent of GPU completion. Wake the existing ring
+  // event when a queued word is ready, including while the worker is idle.
+  if (!packet_memory_writes_.empty() && EndSubmission(false)) {
+    CheckSubmissionFence(0);
+    if (packet_memory_writes_.empty() || device_removed_) {
+      packet_wakeup_submission_ = 0;
+      return;
+    }
+    uint64_t next_submission = packet_memory_writes_.front().submission;
+    if (packet_wakeup_submission_ != next_submission) {
+      if (SUCCEEDED(submission_fence_->SetEventOnCompletion(
+              next_submission, static_cast<HANDLE>(write_ptr_index_event_->native_handle())))) {
+        packet_wakeup_submission_ = next_submission;
+      } else {
+        // Preserve forward progress if the host cannot register a wakeup.
+        CheckSubmissionFence(next_submission);
+      }
+    }
+  }
+}
+
+bool D3D12CommandProcessor::ReadbackSharedMemoryForCpu(
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges, std::vector<uint8_t>& data) {
+  uint32_t total = 0;
+  for (const auto& range : ranges) {
+    if (range.first >= SharedMemory::kBufferSize ||
+        range.second > SharedMemory::kBufferSize - range.first ||
+        range.second > SharedMemory::kBufferSize - total) {
+      return false;
+    }
+    total += range.second;
+  }
+  if (!total) {
+    data.clear();
+    return true;
+  }
+  if (!BeginSubmission(false)) {
+    return false;
+  }
+  ID3D12Resource* buffer = RequestReadbackBuffer(total);
+  if (!buffer) {
+    return false;
+  }
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  uint32_t offset = 0;
+  for (const auto& range : ranges) {
+    deferred_command_list_.D3DCopyBufferRegion(
+        buffer, offset, shared_memory_->GetBuffer(), range.first, range.second);
+    offset += range.second;
+  }
+  if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion() || device_removed_) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, total};
+  void* mapping = nullptr;
+  if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  data.resize(total);
+  std::memcpy(data.data(), mapping, total);
+  D3D12_RANGE no_writes = {};
+  buffer->Unmap(0, &no_writes);
+  return true;
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -2898,7 +5143,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   if (!memory_->TranslatePhysical(written_address)) {
-    return true;
+    return false;
   }
 
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
@@ -2919,7 +5164,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
             &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
             &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
       REXGPU_ERROR("Failed to create a {} MB readback buffer", size >> 20);
-      return true;
+      return false;
     }
     if (rb.buffers[write_index]) {
       if (rb.mapped_data[write_index]) {
@@ -2934,16 +5179,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     if (FAILED(buffer->Map(0, &read_range, &rb.mapped_data[write_index]))) {
       REXGPU_ERROR("Failed to persistently map resolve readback buffer");
       rb.mapped_data[write_index] = nullptr;
+      return false;
     }
   }
 
-  if (!rb.buffers[write_index]) {
-    return true;
+  if (!rb.buffers[write_index] || !rb.mapped_data[write_index]) {
+    return false;
   }
 
   if (is_scaled) {
     if (!resolve_downscale_pipeline_ || !resolve_downscale_root_signature_) {
-      return true;
+      return false;
     }
 
     reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
@@ -2951,23 +5197,23 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint32_t bits_per_pixel = format_info->bits_per_pixel;
     if (bits_per_pixel != 8 && bits_per_pixel != 16 && bits_per_pixel != 32 &&
         bits_per_pixel != 64) {
-      return true;
+      return false;
     }
 
     uint32_t pixel_size_log2;
     if (!rex::bit_scan_forward(bits_per_pixel >> 3, &pixel_size_log2)) {
-      return true;
+      return false;
     }
     uint32_t tile_size_1x = 32 * 32 * (uint32_t(1) << pixel_size_log2);
     uint32_t tile_count = written_length / tile_size_1x;
     if (!tile_count) {
-      return true;
+      return false;
     }
 
     uint32_t scaled_length = uint32_t(texture_cache_->GetCurrentScaledResolveRangeLengthScaled());
     uint64_t scaled_address = texture_cache_->GetCurrentScaledResolveRangeStartScaled();
     if (!scaled_length) {
-      return true;
+      return false;
     }
 
     uint32_t downscale_buffer_size = AlignReadbackBufferSize(written_length);
@@ -2984,7 +5230,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
               IID_PPV_ARGS(&buffer)))) {
         REXGPU_ERROR("Failed to create a {} MB resolve downscale buffer",
                      downscale_buffer_size >> 20);
-        return true;
+        return false;
       }
       if (resolve_downscale_buffer_) {
         resources_for_deletion_.emplace_back(GetCurrentSubmission(),
@@ -2995,23 +5241,23 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     if (!resolve_downscale_buffer_) {
-      return true;
+      return false;
     }
 
     ID3D12Resource* scaled_resolve_buffer = texture_cache_->GetCurrentScaledResolveBufferResource();
     size_t scaled_resolve_buffer_index = texture_cache_->GetCurrentScaledResolveBufferIndexPublic();
     if (!scaled_resolve_buffer) {
-      return true;
+      return false;
     }
     uint64_t scaled_buffer_base = uint64_t(scaled_resolve_buffer_index) << 30;
     if (scaled_address < scaled_buffer_base) {
-      return true;
+      return false;
     }
     uint64_t source_offset = scaled_address - scaled_buffer_base;
 
     ui::d3d12::util::DescriptorCpuGpuHandlePair downscale_descriptors[2];
     if (!RequestOneUseSingleViewDescriptors(2, downscale_descriptors)) {
-      return true;
+      return false;
     }
 
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -3075,8 +5321,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
-    return true;
+  } else if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion() || device_removed_) {
+    return false;
   }
 
   bool is_cache_miss = false;
@@ -3085,7 +5331,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     is_cache_miss = true;
     read_index = write_index;
     if (!AwaitAllQueueOperationsCompletion()) {
-      return true;
+      return false;
     }
   }
 
@@ -3144,6 +5390,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (submission_completed_ < await_submission) {
     REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
   }
+  PublishPacketMemoryWrites(submission_completed_);
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
     return;
@@ -3652,6 +5899,18 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 
   // Flags.
   uint32_t flags = 0;
+  if (REXCVAR_GET(ufc3_undisputed_nx_sonda_tinte) == 4) {
+    static uint64_t checked_frame = UINT64_MAX;
+    static bool enabled = false;
+    if (checked_frame != frame_current_) {
+      checked_frame = frame_current_;
+      std::error_code error;
+      enabled = std::filesystem::exists("capturas/sonda_tinte_on", error);
+    }
+    if (enabled) {
+      flags |= DxbcShaderTranslator::kSysFlag_DiagnosticTint;
+    }
+  }
   // Whether shared memory is an SRV or a UAV. Because a resource can't be in a
   // read-write (UAV) and a read-only (SRV, IBV) state at once, if any shader in
   // the pipeline uses memexport, the shared memory buffer must be a UAV.
@@ -4152,6 +6411,24 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         }
       }
     }
+    if (pixel_shader && IsDiagnosticMaterial(pixel_shader->ucode_data_hash()) &&
+        REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) > 0) {
+      static std::array<uint32_t, 16> captured_bases{};
+      const uint32_t base = uint32_t(regs.GetTextureFetch(0).base_address) << 12;
+      auto slot = std::find(captured_bases.begin(), captured_bases.end(), 0u);
+      if (base && slot != captured_bases.end() &&
+          std::find(captured_bases.begin(), captured_bases.end(), base) == captured_bases.end()) {
+        *slot = base;
+        const std::string path = fmt::format("capturas/gpu_ps_constants_{:08X}.bin", base);
+        if (FILE* file = std::fopen(path.c_str(), "wb")) {
+          std::fwrite(float_constants - float_constant_count_pixel * 16,
+                      16, float_constant_count_pixel, file);
+          std::fclose(file);
+        }
+        REXGPU_WARN("[GPU-constants] base={:08X} count={} cb={:016X}",
+                    base, float_constant_count_pixel, cbuffer_binding_float_pixel_.address);
+      }
+    }
     cbuffer_binding_float_pixel_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_pixel);
   }
@@ -4446,6 +6723,29 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       for (size_t i = 0; i < sampler_count_pixel; ++i) {
         descriptor_indices[(*samplers_pixel)[i].bindless_descriptor_index] =
             current_sampler_bindless_indices_pixel_[i];
+      }
+      if (pixel_shader && IsDiagnosticMaterial(pixel_shader->ucode_data_hash()) &&
+          REXCVAR_GET(ufc3_undisputed_nx_sonda_dibujos) > 0) {
+        static std::array<uint32_t, 16> captured_bases{};
+        const uint32_t base = uint32_t(regs.GetTextureFetch(0).base_address) << 12;
+        auto slot = std::find(captured_bases.begin(), captured_bases.end(), 0u);
+        if (base && slot != captured_bases.end() &&
+            std::find(captured_bases.begin(), captured_bases.end(), base) == captured_bases.end()) {
+          *slot = base;
+          const std::string path = fmt::format("capturas/gpu_ps_descriptors_{:08X}.bin", base);
+          if (FILE* file = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(descriptor_indices, sizeof(uint32_t), texture_count_pixel + sampler_count_pixel, file);
+            std::fclose(file);
+          }
+          for (const auto& texture : *textures_pixel) {
+            const uint32_t value = descriptor_indices[texture.bindless_descriptor_index];
+            REXGPU_WARN("[GPU-descriptors] base={:08X} fc={} signed={} slot={} relative={} absolute={} cb={:016X}",
+                        base, texture.fetch_constant, texture.is_signed,
+                        texture.bindless_descriptor_index, value,
+                        value + uint32_t(SystemBindlessView::kUnboundedSRVsStart),
+                        cbuffer_binding_descriptor_indices_pixel_.address);
+          }
+        }
       }
       cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
       current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
@@ -4794,7 +7094,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
       return nullptr;
     }
     if (readback_buffer_ != nullptr) {
-      readback_buffer_->Release();
+      resources_for_deletion_.emplace_back(GetCurrentSubmission(), readback_buffer_);
     }
     readback_buffer_ = buffer;
     readback_buffer_size_ = size;

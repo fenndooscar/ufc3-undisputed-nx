@@ -113,6 +113,17 @@ class D3D12TextureCache final : public TextureCache {
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
 
+  // TEMPORARY CAF diagnostic: snapshot the active unsigned 2D/cube GPU resource
+  // in an open submission, without requesting textures or changing descriptors.
+  // Outputs change only on success. Keep readback alive until the caller submits
+  // and awaits GPU completion, then Map subresource 0 once for total_bytes.
+  // layouts[i].Offset is relative to the mapping; i = mip + array_slice *
+  // description.MipLevels. RowPitch includes padding (BC formats use block rows).
+  bool QueueActiveTextureReadback(
+      uint32_t fetch_constant, Microsoft::WRL::ComPtr<ID3D12Resource>& readback,
+      D3D12_RESOURCE_DESC& description,
+      std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>& layouts, uint64_t& total_bytes);
+
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
@@ -201,10 +212,10 @@ class D3D12TextureCache final : public TextureCache {
     LoadShaderIndex load_shader_signed;
 
     // Do NOT add integer DXGI formats to this - they are not filterable, can
-    // only be read with Load, not Sample! If any game is seen using num_format
-    // 1 for fixed-point formats (for floating-point, it's normally set to 1
-    // though), add a constant buffer containing multipliers for the
-    // textures and multiplication to the tfetch implementation.
+    // only be read with Load, not Sample! The tfetch translator restores the
+    // integer range for unsigned fixed-point 16-bit formats when num_format=1.
+    // Other fixed-point integer formats still need range conversion; floating
+    // formats normally set num_format=1 and must keep their sampled values.
 
     // Whether the DXGI format, if not uncompressing the texture, consists of
     // blocks, thus copy regions must be aligned to block size (assuming it's

@@ -129,8 +129,6 @@ class FunctionDispatcher : public IModuleRegistrar {
   memory::Memory* memory_ = nullptr;
   ExportResolver* export_resolver_ = nullptr;
 
-  rex::thread::global_critical_region global_critical_region_;
-
   // Host-side function lookup.
   std::unordered_map<uint32_t, ::PPCFunc*> function_table_;
 

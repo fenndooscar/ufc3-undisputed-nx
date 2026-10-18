@@ -6,7 +6,7 @@
   open source Vulkan driver for NVIDIA GPUs, which is part of the **Mesa** project.
 - It comes from [danfromtico/mesa-switch](https://github.com/danfromtico/mesa-switch), a version of Mesa 26.2.1 that
   runs on the Switch's operating system (called Horizon).
-- This port adds its own changes on top. They are all in one file of this folder: `mesa-switch-nfsmw.patch`.
+- This port adds its own changes on top. They are all in one file of this folder: `mesa-switch-ufc3-undisputed-nx.patch`.
 - Building Mesa gives a library, `libvulkan.a`, and the NRO includes it.
 
 ## Getting the same driver as the released NROs
@@ -23,7 +23,7 @@
    (35 changed files):
 
    ```sh
-   git apply ../nfsmw-nx/mesa/mesa-switch-nfsmw.patch
+   git apply ../ufc3-undisputed-nx/mesa/mesa-switch-ufc3-undisputed-nx.patch
    ```
 
 3. Build it. The first time, use mesa-switch's own script, `build-unified.sh` (its README explains how). Later
@@ -77,12 +77,12 @@ You will not find it written in the patch or in any header, because Mesa's build
 There are two ways:
 
 - **The port's own settings.** ZCULL, the faster draws and the set 4 by differences are requested by the port, with
-  settings in `nfsmw.toml` (also in the Debug Menu), all on: `nfsmw_nativo_zcull`, `nfsmw_nativo_set4_diferencias`
-  and, for the faster draws, `nfsmw_nativo_nvk_emision`, `nfsmw_nativo_nvk_cbufs`, `nfsmw_nativo_nvk_dinamico` and
-  `nfsmw_nativo_nvk_precarga`. The faster draws and the set 4 by differences also check themselves: on some draws they
+  settings in `ufc3-undisputed-nx.toml` (also in the Debug Menu), all on: `ufc3-undisputed-nx_nativo_zcull`, `ufc3-undisputed-nx_nativo_set4_diferencias`
+  and, for the faster draws, `ufc3-undisputed-nx_nativo_nvk_emision`, `ufc3-undisputed-nx_nativo_nvk_cbufs`, `ufc3-undisputed-nx_nativo_nvk_dinamico` and
+  `ufc3-undisputed-nx_nativo_nvk_precarga`. The faster draws and the set 4 by differences also check themselves: on some draws they
   compare their result with the normal way, and if they ever see a difference, they turn off.
-- **Environment variables for the driver.** You do not set them in Windows: write them in `nfsmw.toml`, in the setting
-  `nfsmw_mesa_entorno`, separated by `;`, for example `nfsmw_mesa_entorno = "NVK_COPY_ENGINE=1;NVK_SHADER_STATS=1"`.
+- **Environment variables for the driver.** You do not set them in Windows: write them in `ufc3-undisputed-nx.toml`, in the setting
+  `ufc3-undisputed-nx_mesa_entorno`, separated by `;`, for example `ufc3-undisputed-nx_mesa_entorno = "NVK_COPY_ENGINE=1;NVK_SHADER_STATS=1"`.
   Empty, as released, means the driver's normal behavior.
 
 | Variable | Normally | What it does |
@@ -99,7 +99,7 @@ There are two ways:
 1. Rebuild and install it with `build_mesa_msys2.sh`, from an MSYS2 MINGW64 window.
 2. Copy `libvulkan.a` (the shader compiler, NAK, is inside it), `libnvk.a` and `libnak_rs.a` to the SDK folder the app
    uses.
-3. Delete `app/out/sw8/nfsmw` and `app/out/sw8/nfsmw.nro` before building the app. Otherwise the build does not notice
+3. Delete `app/out/sw8/ufc3-undisputed-nx` and `app/out/sw8/ufc3-undisputed-nx.nro` before building the app. Otherwise the build does not notice
    that the driver changed, and the NRO keeps the old one.
 4. If you changed the shader compiler (NAK), raise the revision number in `nvk_shader.c`. On the Switch that number is
    what tells old compiled shaders from new ones: without it, the game would keep using shaders compiled with the old

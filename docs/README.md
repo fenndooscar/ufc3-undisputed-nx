@@ -1,5 +1,15 @@
 # Documentation
 
+> [!WARNING]
+> **These documents were written for the previous game**, *Need for Speed: Most Wanted*, whose port this repository
+> started as a fork of. Every address, hook, function name, structure offset and measured number in them belongs to
+> that game and is wrong for UFC 3 Undisputed.
+>
+> Read them for the **machinery** — the Horizon layer, the shader tooling, the build scripts, the toolchain traps, the
+> order of the work — which is sound and reusable. Do not read them as a description of this port. For what actually
+> holds here, see [README.md](../README.md), [AGENTS.md](../AGENTS.md) and
+> [app/src/aparcado/README.md](../app/src/aparcado/README.md).
+
 ## Start here
 
 These documents explain how the port works, how to build it, and how to use it as a guide to port another Xbox 360

@@ -8,7 +8,7 @@
 - It runs on the Switch thanks to [danfromtico/mesa-switch](https://github.com/danfromtico/mesa-switch), which adds
   the Switch-specific part (it talks to the Switch's GPU driver: channels, memory through NvMap, fences) and builds one
   library, `libvulkan.a`, for homebrew programs. That library, with NAK inside, is included in the NRO.
-- Everything this port changed is in one file, [mesa/mesa-switch-nfsmw.patch](../mesa/mesa-switch-nfsmw.patch),
+- Everything this port changed is in one file, [mesa/mesa-switch-ufc3-undisputed-nx.patch](../mesa/mesa-switch-ufc3-undisputed-nx.patch),
   made against commit `1a8c1a66d6f` of mesa-switch.
 - This page explains why each change was made and what it gained. [mesa/README.md](../mesa/README.md) has the steps to
   get the source, the list of files and how to rebuild.
@@ -43,7 +43,7 @@ solve when you build:
    opaque: Mesa only uses it through pointers.
 
 The install step leaves an SDK folder. The app is pointed at its `opt/devkitpro/portlibs/switch` subfolder with
-`REXGLUE_SWITCH_NVK_SDK`. **After you replace the libraries, delete `app/out/sw8/nfsmw` and `nfsmw.nro`**: Ninja does
+`REXGLUE_SWITCH_NVK_SDK`. **After you replace the libraries, delete `app/out/sw8/ufc3-undisputed-nx` and `ufc3-undisputed-nx.nro`**: Ninja does
 not notice a library that changed outside its build folder, and would keep the old driver.
 
 ## ZCULL: skipping hidden pixels
@@ -140,7 +140,7 @@ descriptor sets and the constant buffers, and writing the GPU state. The patch a
 - **Set 4 by differences.** The renderer's per-draw constants (descriptor set 4) are written as a difference against
   the previous draw: 1 write instead of 4.
 
-The app turns each of these on with its own settings (`nfsmw_nativo_nvk_*` and `nfsmw_nativo_set4_diferencias`), and
+The app turns each of these on with its own settings (`ufc3-undisputed-nx_nativo_nvk_*` and `ufc3-undisputed-nx_nativo_set4_diferencias`), and
 each one checks itself inside the driver.
 
 Tried and dropped: moving to Vulkan's extended dynamic state (EDS 1, 2 and 3) with a simpler pipeline key. It cut

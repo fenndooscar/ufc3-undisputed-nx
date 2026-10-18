@@ -21,7 +21,7 @@
 3. **Compile for the Switch** with devkitA64 (GCC 16), through CMake and Ninja, with [LTO](glossary.md#lto),
    [PGO](glossary.md#pgo) and [function ordering](glossary.md#function-ordering). The result is packed as an NRO.
 4. **Check the result** before you share a build:
-   - `nm nfsmw | grep " _start$"` must print the address `0000000000000000`. If not, the NRO will not start (see
+   - `nm ufc3-undisputed-nx | grep " _start$"` must print the address `0000000000000000`. If not, the NRO will not start (see
      [Function ordering](#function-ordering)).
    - `tools/comprobar_clave_textura.py` ("check texture key") checks one piece of compiled code in the final program
      (see [the xxHash pitfall](#an-lto-and-pgo-pitfall-strict-aliasing-in-xxhash)).

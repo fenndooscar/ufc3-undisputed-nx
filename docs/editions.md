@@ -6,7 +6,7 @@ is a different program that needs its own build of the NRO. This page lists the 
 code is carried from one edition to another, and how the installer page picks the right build. Read it to add an
 edition, or when you port a game that came out in several editions.
 
-The [installer page](https://stevensnd.github.io/nfsmw-nx-installer/) picks the build by the SHA-256 (a fingerprint
+The [installer page](https://stevensnd.github.io/ufc3-undisputed-nx-installer/) picks the build by the SHA-256 (a fingerprint
 of a file's contents) of the player's executable. For editions that were verified with a specific disc, it also
 checks the size of one data file, `NFS/ZZDATA0.BIN`. See [Installer manifest](#installer-manifest).
 
@@ -64,7 +64,7 @@ of the reference executable. In other editions the same functions are often at o
    ```
 
    The images are the decompressed executables (the PE image inside each `default.xex`), not the `.xex` files.
-   `test/save_image.mjs` in the [installer's repository](https://github.com/StevensND/nfsmw-nx-installer) saves it
+   `test/save_image.mjs` in the [installer's repository](https://github.com/StevensND/ufc3-undisputed-nx-installer) saves it
    from an ISO (`node test/save_image.mjs <iso> <output image>`).
 2. **Verify the hooked functions.** `verificar_ganchos.py` ("verify hooks") compares every hooked function in full
    between the two executables. This is needed because step 1 only compares short pieces of code, and a hook depends
@@ -111,7 +111,7 @@ hooks as the reference.
 ## Installer manifest
 
 The installer page reads `release/manifest.json`, in the
-[installer's repository](https://github.com/StevensND/nfsmw-nx-installer). Each entry gives:
+[installer's repository](https://github.com/StevensND/ufc3-undisputed-nx-installer). Each entry gives:
 
 - the edition name and the SHA-256 of its executable;
 - the NRO to use and its SHA-256;

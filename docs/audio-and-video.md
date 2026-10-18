@@ -12,7 +12,7 @@ of it applies to other ports too. The audio path has three parts:
   FFmpeg, an open source audio and video library;
 - **the Switch output driver**, which sends the mixed sound to the console's audio output.
 
-The settings named on this page go in `nfsmw.toml`, next to the NRO (see [nfsmw.toml](glossary.md#nfsmwtoml)).
+The settings named on this page go in `ufc3-undisputed-nx.toml`, next to the NRO (see [ufc3-undisputed-nx.toml](glossary.md#ufc3-undisputed-nxtoml)).
 
 ## In short
 
@@ -60,11 +60,11 @@ game thread and another busy guest thread, and the GPU ring thread ran above it 
 [platform-notes.md](platform-notes.md#threads) for how priorities work on the Switch). In crashes it delivered only
 89 % of its packets.
 
-- The server now runs at 0x2D (setting `nfsmw_audio_servidor_prioridad`).
+- The server now runs at 0x2D (setting `ufc3-undisputed-nx_audio_servidor_prioridad`).
 - The audio worker (the thread that mixes each audio frame) may wait up to 30 ms for a late packet, instead of mixing
-  that voice as silence (setting `nfsmw_audio_esperar_servidor_ms`).
+  that voice as silence (setting `ufc3-undisputed-nx_audio_esperar_servidor_ms`).
 
-Both are in `app/src/nfsmw_audio_servidor.cpp`. Together they made the problem "barely noticeable".
+Both are in `app/src/ufc3-undisputed-nx_audio_servidor.cpp`. Together they made the problem "barely noticeable".
 
 The SDK's priority table also had a bug. It compared thread names exactly, but thread names get a ` (F80000xx)`
 suffix, so the audio worker and the XMA decoder never got the priority meant for them. It now compares with
@@ -78,8 +78,8 @@ recompiled code. The C++ does the same floating-point operations in the same ord
 for example `double(float(std::fma(...)))`, and the PowerPC instruction `fnmsubs` written as `-std::fma(x, y, -z)`.
 Over 159 million samples there were zero differences. The server's CPU time dropped by 17.5 %.
 
-The code is in `app/src/`: `nfsmw_audio_remuestreo.cpp` (resamplers), `nfsmw_audio_filtro.cpp` (filter),
-`nfsmw_audio_suma.cpp` (gain sum) and `nfsmw_crt_nativo.cpp` (`memset`).
+The code is in `app/src/`: `ufc3-undisputed-nx_audio_remuestreo.cpp` (resamplers), `ufc3-undisputed-nx_audio_filtro.cpp` (filter),
+`ufc3-undisputed-nx_audio_suma.cpp` (gain sum) and `ufc3-undisputed-nx_crt_nativo.cpp` (`memset`).
 
 ### 3. XMA decoding off the game's thread
 
@@ -120,8 +120,8 @@ timeout. When it wakes up and its slot is still busy, it goes back to waiting wi
 lost end-of-packet notification stops it for good, and with it the game's queue of audio commands.
 
 **Fix:** a timeout on that wait. After 250 ms without progress, the thread retries the delivery and frees the slot.
-A timeout alone is not enough: the loop must also retry. The code is in `app/src/nfsmw_audio_servidor.cpp` (setting
-`nfsmw_audio_rescate`, on by default).
+A timeout alone is not enough: the loop must also retry. The code is in `app/src/ufc3-undisputed-nx_audio_servidor.cpp` (setting
+`ufc3-undisputed-nx_audio_rescate`, on by default).
 
 **Lesson:** when a failure is intermittent, one run with working audio does not prove that a build is good.
 
@@ -133,8 +133,8 @@ at 30 frames per second). So videos stuttered and their audio ended before the p
 
 The port now gives the same bytes to FFmpeg's WMV3 decoder instead. It reads them through the game's own data
 callbacks, and writes the decoded image planes (the Y, U and V parts of each frame) where the game expects them.
-Videos now take 7-15 ms per frame. The code is in `app/src/nfsmw_video_nativo.cpp` and `app/src/nfsmw_video_wmv3.cpp`,
-and the setting `nfsmw_video_wmv3_nativo` turns it on (on by default).
+Videos now take 7-15 ms per frame. The code is in `app/src/ufc3-undisputed-nx_video_nativo.cpp` and `app/src/ufc3-undisputed-nx_video_wmv3.cpp`,
+and the setting `ufc3-undisputed-nx_video_wmv3_nativo` turns it on (on by default).
 
 - **License.** FFmpeg is linked under the LGPL 2.1 (the SDK's build, configured without GPL parts). Do not link a GPL
   build.
@@ -142,7 +142,7 @@ and the setting `nfsmw_video_wmv3_nativo` turns it on (on by default).
   - identify the video by the stream being decoded, not by the last `.wmv` opened: the game opens the next one early;
   - read through the game's data callback instead of opening the file separately;
   - leave the "data remaining" count where the game expects it, or the game drops the next frame.
-- **Checking.** A shadow mode (setting `nfsmw_video_wmv3_sombra`, off by default) decodes with both decoders and
+- **Checking.** A shadow mode (setting `ufc3-undisputed-nx_video_wmv3_sombra`, off by default) decodes with both decoders and
   compares them. The videos were identical bit for bit, except for three short sections of one video with a mean
   difference of 0.02.
 - **Re-encoded videos (fan translations).** The game's own videos only have I frames (complete pictures) and P frames
@@ -157,7 +157,7 @@ and the setting `nfsmw_video_wmv3_nativo` turns it on (on by default).
   - if FFmpeg fails on one of these videos, the last good picture is shown again until the next I frame, because
     the game's decoder cannot be used as a fallback with them.
 
-  The setting `nfsmw_video_wmv3_b_diag` (off by default) logs which picture planes and which fields of the decoder
+  The setting `ufc3-undisputed-nx_video_wmv3_b_diag` (off by default) logs which picture planes and which fields of the decoder
   context each frame changes. It was used to find where the game leaves each type of frame.
 - **Frame counters read 30.** During videos the game presents 30 frames per second, so frame counters read 30, not 60.
 
@@ -167,4 +167,4 @@ Each XMA context opens FFmpeg's decoder again for every new sound, and every tim
 tables. In busy moments, `ff_mdct_init`, the split-radix permutation and the sine/cosine tables took about 28 % of
 the XMA thread. Now FFmpeg's FFT and MDCT code keeps the bit-reversal table and the twiddle factors in a cache, so
 they are built only once. That removed the cost. The change is in `sdk/thirdparty/FFmpeg/libavcodec/fft_template.c`
-and `mdct_template.c`, in the parts marked `NFSMW`.
+and `mdct_template.c`, in the parts marked `UFC3_UNDISPUTED_NX`.

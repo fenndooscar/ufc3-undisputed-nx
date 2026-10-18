@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -164,6 +165,10 @@ class BaseHeap {
 
   uint32_t GetTotalPageCount();
   uint32_t GetUnreservedPageCount();
+  // Largest run of unreserved pages, in pages. A large free total with a small
+  // largest run is what makes a big allocation fail (UFC 3 Undisputed's 8 MB
+  // memexport stream is the observed case).
+  uint32_t GetLargestUnreservedSpanPages();
 
   uint32_t total_page_count() const { return uint32_t(page_table_.size()); }
   uint32_t unreserved_page_count() const { return unreserved_page_count_; }
@@ -254,6 +259,9 @@ class BaseHeap {
   // protection, so silently unprotecting here would disable the watch forever.
   // Only PhysicalHeap tracks this; every other heap has no watch state.
   virtual bool IsHostPageWriteWatched(uint32_t host_page_number) const { return false; }
+  virtual bool IsHostPageDataWatched(uint32_t host_page_number) const { return false; }
+  virtual rex::memory::PageAccess GetHostPageAccess(
+      uint32_t host_page_number, rex::memory::PageAccess fallback) const { return fallback; }
 
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
@@ -291,6 +299,7 @@ class VirtualHeap : public BaseHeap {
 // implemented by having a 'parent' heap that is used to perform allocation in
 // the guest virtual address space 1:1 with the physical address space.
 class PhysicalHeap : public BaseHeap {
+  friend class Memory;
  public:
   PhysicalHeap();
   ~PhysicalHeap() override;
@@ -318,12 +327,17 @@ class PhysicalHeap : public BaseHeap {
   // Returns true if any page in the range was watched.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
-                        bool unwatch_exact_range, bool unprotect = true);
+                        bool unwatch_exact_range, bool unprotect = true, bool discard = false,
+                        bool* provider_failed = nullptr);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
+  void DisableDataProviders();
 
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
+  bool IsHostPageDataWatched(uint32_t host_page_number) const override;
+  rex::memory::PageAccess GetHostPageAccess(
+      uint32_t host_page_number, rex::memory::PageAccess fallback) const override;
 
   // Allocation on these heaps delegates to parent_heap_, whose own reconcile
   // pass takes the global critical region. Acquire whenever this heap or its
@@ -340,6 +354,8 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    uint64_t data_provider;
+    uint64_t provider_generation;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
@@ -479,8 +495,14 @@ class Memory {
   //
   // - Data providers:
   //
-  // TODO(Triang3l): Implement data providers - more complicated because they
-  // will need to be able to release the global lock.
+  // Providers run before a CPU read or partial write. They return with the
+  // once-held global lock owned, releasing it while waiting for device work.
+  // They write through TranslatePhysical to avoid recursive alias faults.
+  using PhysicalMemoryDataProvider = bool (*)(
+      void* context, std::unique_lock<std::recursive_mutex>& global_lock,
+      uint32_t physical_address, uint32_t length);
+  void* RegisterPhysicalMemoryDataProvider(PhysicalMemoryDataProvider callback, void* context);
+  void UnregisterPhysicalMemoryDataProvider(void* handle);
 
   // Returns start and length of the smallest physical memory region surrounding
   // the watched region that can be safely unwatched, if it doesn't matter,
@@ -504,11 +526,9 @@ class Memory {
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
   // watched. Must be called with global critical region locking depth of 1.
-  // TODO(Triang3l): Implement data providers - this is why locking depth of 1
-  // will be required in the future.
   bool TriggerPhysicalMemoryCallbacks(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
-      uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect = true);
+      uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect = true, bool discard = false);
 
   // Allocates virtual memory from the 'system' heap.
   // System memory is kept separate from game memory but is still accessible
@@ -624,6 +644,17 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+  struct PhysicalDataProvider {
+    PhysicalMemoryDataProvider callback;
+    void* context;
+    bool registered = true;
+    size_t active_calls = 0;
+    std::condition_variable_any idle;
+  };
+  std::vector<std::shared_ptr<PhysicalDataProvider>> physical_memory_data_providers_;
+  bool ProvidePhysicalMemoryData(std::unique_lock<std::recursive_mutex>& global_lock,
+                                uint32_t address, uint32_t length);
+  void DisablePhysicalMemoryDataProviders();
 };
 
 }  // namespace rex::memory
